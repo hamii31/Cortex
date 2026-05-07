@@ -2,7 +2,7 @@
 
 A fully offline chat app for local LLMs via Ollama, with built-in document indexing and retrieval-augmented generation. Drop a PDF, EPUB, DOCX, or text file into the window, attach it to a conversation, and query it with a model of your choice running on your own hardware. No cloud, no telemetry, no internet required after setup.
 
-![offline](https://img.shields.io/badge/offline-yes-67e480?style=flat-square) ![ollama](https://img.shields.io/badge/runtime-ollama-5dd9ff?style=flat-square) ![rag](https://img.shields.io/badge/RAG-built--in-ff9d5d?style=flat-square)
+![offline](https://img.shields.io/badge/offline-yes-67e480?style=flat-square) ![ollama](https://img.shields.io/badge/runtime-ollama-5dd9ff?style=flat-square) ![rag](https://img.shields.io/badge/RAG-built--in-ff9d5d?style=flat-square) [![DOI](https://zenodo.org/badge/1231694841.svg)](https://doi.org/10.5281/zenodo.20069615)
 
 ## What it is
 
