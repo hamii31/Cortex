@@ -67,9 +67,12 @@ The retrieval pipeline:
 ## Requirements
 
 - **Ollama** ([install](https://ollama.com))
-- **~24 GB RAM or VRAM** for the default `qwen2.5:32b` Q4 model
-  - Smaller hardware can use `qwen2.5:7b` or `qwen2.5:14b` instead — see Configuration
-- **~3 GB disk** for models (model + embedder)
+- **GPU/RAM**, depending on the model you want to run:
+  - **8 GB VRAM** for the default `qwen2.5:7b` (the typical mid-range laptop GPU)
+  - **16 GB VRAM** for `qwen2.5:14b` (noticeably better reasoning)
+  - **24 GB VRAM** for `qwen2.5:32b` (the practical ceiling for consumer hardware)
+  - Lower VRAM still works via Ollama's CPU/GPU split, but expect slow generation
+- **~5 GB disk** for default models (chat + embedder)
 - Python 3.10+ only required if running from source
 
 ## Installation
@@ -80,7 +83,7 @@ The retrieval pipeline:
 2. Install Ollama from [ollama.com](https://ollama.com) if you haven't already.
 3. Pull the default models the first time:
    ```bash
-   ollama pull qwen2.5:32b           # ~18 GB, the chat model
+   ollama pull qwen2.5:7b            # ~4.7 GB, the default chat model
    ollama pull nomic-embed-text      # ~270 MB, for retrieval
    ```
 4. Double-click the executable. Cortex starts a local server and opens your default browser to the chat UI. If Ollama isn't running, you'll get a dialog explaining what to do.
@@ -97,7 +100,7 @@ git clone https://github.com/hamii31/Cortex.git
 cd Cortex
 
 # 2. Install Ollama (see ollama.com), then pull models:
-ollama pull qwen2.5:32b
+ollama pull qwen2.5:7b
 ollama pull nomic-embed-text
 
 # 3. Install Python dependencies
@@ -169,11 +172,11 @@ Configure via environment variables before launching:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CORTEX_MODEL` | `qwen2.5:32b` | Any Ollama model. For 16 GB hardware, try `qwen2.5:7b` or `qwen2.5:14b`. For more capability and 40+ GB hardware, try `llama3.3:70b`. |
+| `CORTEX_MODEL` | `qwen2.5:7b` | Any Ollama model. Bump to `qwen2.5:14b` on 16 GB GPUs or `qwen2.5:32b` on 24 GB GPUs for noticeably stronger reasoning. `llama3.3:70b` is the high end for 40+ GB hardware. |
 | `CORTEX_EMBED_MODEL` | `nomic-embed-text` | Embedding model used for both indexing and retrieval. Must be available in Ollama. |
 | `CORTEX_HOST` | `127.0.0.1` | Set to `0.0.0.0` to expose to your local network (no auth — be careful). |
 | `CORTEX_PORT` | `8000` | HTTP port. |
-| `CORTEX_TOP_K` | `6` | Number of chunks retrieved per query, merged across all attached books. |
+| `CORTEX_TOP_K` | `4` | Number of chunks retrieved per query, merged across all attached books. Bump to 6–8 for larger models with more context room. |
 | `CORTEX_LIBRARY` | platform-specific | Override the library cache directory. |
 | `CORTEX_SMARTREADER_CACHE` | auto-detected | Path to a SmartReader cache to also expose. Set explicitly to override. |
 
@@ -234,9 +237,13 @@ You're running an older version of `cortex.py`. Update — the fix removes `__sl
 
 Embedding throughput is the bottleneck and runs through Ollama. A 900-page book takes 15–30 minutes on a single GPU. This is the same speed SmartReader achieves — it's not Cortex overhead, it's just how long that many embedding calls take. Index in the background and avoid running large chat queries simultaneously.
 
+### CUDA error 500 / "shared object initialization failed"
+
+The model is too big for your GPU. Either use a smaller model (`CORTEX_MODEL=qwen2.5:7b`) or restart Ollama and let it auto-tune the GPU/CPU split. The 7B default fits 8 GB VRAM cleanly; 14B needs 16 GB and 32B needs 24 GB. If you've recently crashed the runner, restart Ollama (right-click the tray icon → Quit, then start again) before retrying — the GPU context can stay in a bad state until Ollama is fully restarted.
+
 ### Out of memory on the chat model
 
-Switch to a smaller model: `CORTEX_MODEL=qwen2.5:14b python cortex.py`. Or `qwen2.5:7b` for 8 GB hardware. Quality drops but the app is identical.
+Switch to a smaller model: `CORTEX_MODEL=qwen2.5:7b cortex.exe` (or just rely on the default). For very tight VRAM, even `gemma2:2b` works. Quality drops but the app is identical.
 
 ### Citations point to wrong pages
 
