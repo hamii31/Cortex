@@ -72,10 +72,15 @@ Cortex ships in three tiers. **Pick the one that matches your hardware**:
    # Then ONE of these, matching your downloaded build:
    ollama pull qwen2.5:7b                        # for Cortex 7B
    ollama pull qwen2.5:14b                       # for Cortex 14B
-   ollama pull hf.co/bartowski/Qwen2.5-32B-Instruct-GGUF:Q4_K_L     # for Cortex 32B Research
+   ollama pull hf.co/bartowski/Qwen2.5-32B-Instruct-GGUF:Qwen2.5-32B-Instruct-Q4_K_L.gguf    # for Cortex 32B Research
+```
+4. (32B Research only) Tag the HuggingFace model with the short name Cortex expects:
+
+```bash
+    ollama cp hf.co/bartowski/Qwen2.5-32B-Instruct-GGUF:Qwen2.5-32B-Instruct-Q4_K_L.gguf qwen2.5:32b-instruct-q4_K_L
 ```
 
-4. Double-click the executable. Cortex starts a local server and opens your default browser to the chat UI. If Ollama isn't running, you'll get a dialog explaining what to do.
+5. Double-click the executable. Cortex starts a local server and opens your default browser to the chat UI. If Ollama isn't running, you'll get a dialog explaining what to do.
 
 A log file at `cortex.log` next to the executable captures any errors — useful when filing bug reports.
 
