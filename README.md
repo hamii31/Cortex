@@ -259,27 +259,31 @@ Until I have fixed this bug, which occurs after closing the executable, you shou
 
 #### LINUX:
 ##### Find the PID and stop it (replace port and PID as needed):
-bash
-```sudo ss -ltnp '( sport = :8000 )'```
+```bash
+sudo ss -ltnp '( sport = :8000 )'
+```
 
 ##### then kill the PID shown (replace <PID>)
-bash
-```sudo kill <PID>        # graceful
+```bash
+sudo kill <PID>        # graceful
 sudo kill -9 <PID>     # forceful
 ```
 
 ##### Alternatively kill by command name (replace pattern):
-bash
-```sudo pkill -f 'pattern'```
+```bash
+sudo pkill -f 'pattern'
+```
 
 #### WINDOWS:
 ##### Find what's listening on port 8000
-bash
-```Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess```
+```bash
+Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess
+```
 
 ##### Then kill that PID:
-bash
-```Stop-Process -Id <PID> -Force```
+```bash
+Stop-Process -Id <PID> -Force
+```
 
 ## Privacy and data handling
 
