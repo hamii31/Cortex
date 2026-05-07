@@ -249,43 +249,11 @@ Switch to a smaller tier from the Releases page, or override at launch: `CORTEX_
 
 ### Citations point to wrong pages
 
-For non-PDF formats, "page" is a soft concept (chapter for EPUB, ~3000-char section for DOCX/text). The model is told this in the system prompt but the citation grammar still reads as "p. N" for consistency. If you want stricter citations for a DOCX, convert it to PDF first and re-index.
+For non-PDF formats, "page" is a soft concept (chapter for EPUB, ~3000-char section for DOCX/text). The model is told this in the system prompt but the citation grammar still reads as "p. N" for consistency. If you want stricter citations for a DOCX, convert it to PDF first and re-index. Keep in mind that the model may start hallucinating citations if you are working with multiple large files. 
 
 ### Retrieval misses obviously relevant content
 
 The default embedding truncates each chunk to 500 characters before embedding (matches SmartReader's behavior so caches are interchangeable). For technical documents with key information past the first 500 characters of a chunk, this can hurt recall. If you want full-text embedding, change `EMBED_TRUNCATE = 500` to `EMBED_TRUNCATE = 2000` near the top of the file and re-index. Be aware: SmartReader caches will no longer be query-equivalent if you do this.
-
-### Kill process listening on port 8000
-
-Until I have fixed this bug, which occurs after closing the executable, you should utilize the following commands to terminate the process running on port 8000:
-
-#### LINUX:
-##### Find the PID and stop it (replace port and PID as needed):
-```bash
-sudo ss -ltnp '( sport = :8000 )'
-```
-
-##### then kill the PID shown (replace <PID>)
-```bash
-sudo kill         # graceful
-sudo kill -9      # forceful
-```
-
-##### Alternatively kill by command name (replace pattern):
-```bash
-sudo pkill -f 'pattern'
-```
-
-#### WINDOWS:
-##### Find what's listening on port 8000
-```bash
-Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess
-```
-
-##### Then kill that PID:
-```bash
-Stop-Process -Id  -Force
-```
 
 ## Privacy and data handling
 
