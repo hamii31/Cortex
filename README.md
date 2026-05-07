@@ -253,14 +253,28 @@ For non-PDF formats, "page" is a soft concept (chapter for EPUB, ~3000-char sect
 
 The default embedding truncates each chunk to 500 characters before embedding (matches SmartReader's behavior so caches are interchangeable). For technical documents with key information past the first 500 characters of a chunk, this can hurt recall. If you want full-text embedding, change `EMBED_TRUNCATE = 500` to `EMBED_TRUNCATE = 2000` near the top of the file and re-index. Be aware: SmartReader caches will no longer be query-equivalent if you do this.
 
-### Processes don't stop by themselves
+### Kill process listening on port 8000
 
-Sometimes after closing the executable, the port might still be running the process. Until I have fixed that, you should use the following powershell comands to stop the process:
+Until I have fixed this bug, which occurs after closing the executable, you should utilize the following commands to terminate the process running on port 8000:
 
-**Find what's listening on port 8000**
-Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess
-**Then kill that PID:**
-Stop-Process -Id <PID> -Force
+#### LINUX:
+##### Find the PID and stop it (replace port and PID as needed):
+`sudo ss -ltnp '( sport = :8000 )'`
+
+##### then kill the PID shown (replace <PID>)
+`sudo kill <PID>        # graceful`
+`sudo kill -9 <PID>     # forceful`
+
+##### Alternatively kill by command name (replace pattern):
+
+`sudo pkill -f 'pattern'`
+
+#### WINDOWS:
+##### Find what's listening on port 8000
+`Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess`
+
+##### Then kill that PID:
+`Stop-Process -Id <PID> -Force`
 
 ## Privacy and data handling
 
