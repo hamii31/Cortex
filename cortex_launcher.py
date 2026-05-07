@@ -166,6 +166,71 @@ def _show_error_and_exit(title: str, message: str, log_file: Path) -> "None":
     sys.exit(1)
 
 
+def _check_existing_instance(host: str, port: int) -> str:
+    """Probe the URL to see if another Cortex instance is already running.
+
+    Returns:
+        "ours"     — a Cortex server is responding (we can reuse it)
+        "foreign"  — port is held by something that isn't Cortex
+        "free"     — nobody is listening on the port
+    """
+    import urllib.request
+    import urllib.error
+    url = f"http://{host}:{port}/api/model"
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            if resp.status == 200:
+                # Cortex's /api/model returns JSON with a 'model' key.
+                # Anything else on the port is foreign.
+                body = resp.read(2048).decode("utf-8", errors="replace")
+                if '"model"' in body:
+                    return "ours"
+                return "foreign"
+    except urllib.error.URLError:
+        return "free"
+    except Exception:
+        return "free"
+    return "foreign"
+
+
+def _kill_existing_instance(host: str, port: int) -> bool:
+    """Try to shut down a stuck Cortex instance via the API, then forcibly
+    if that fails. Returns True if the port appears free afterward."""
+    import urllib.request
+    # Try a graceful shutdown first.
+    try:
+        req = urllib.request.Request(
+            f"http://{host}:{port}/api/shutdown",
+            method="POST",
+            data=b"",
+        )
+        urllib.request.urlopen(req, timeout=2)
+        time.sleep(1.5)   # wait for the process to actually exit
+    except Exception:
+        pass
+
+    # Did the port free up?
+    if _check_existing_instance(host, port) == "free":
+        return True
+
+    # Forced kill on Windows. Linux/macOS: harder to do without sudo;
+    # we just report the issue.
+    if sys.platform == "win32":
+        import subprocess
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "Cortex.exe", "/T"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            time.sleep(1.0)
+        except Exception:
+            pass
+
+    return _check_existing_instance(host, port) == "free"
+
+
 def _open_browser_when_ready(url: str, max_wait: float = 10.0) -> None:
     """Wait until the server accepts connections, then open the browser."""
     import urllib.request
@@ -216,6 +281,31 @@ def main() -> int:
     ollama_host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
     url = f"http://{host}:{port}"
 
+    # If a Cortex instance is already running, just open the browser to it
+    # rather than failing on a port-in-use error. If a foreign process holds
+    # the port, try to free it (this catches stuck Cortex processes that
+    # didn't clean up properly — the most common scenario).
+    instance_state = _check_existing_instance(host, port)
+    if instance_state == "ours":
+        logging.info("Existing Cortex instance found at %s — opening browser.", url)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+        return 0
+    elif instance_state == "foreign":
+        logging.warning("Port %d is held by another process. Attempting to free it.", port)
+        if _kill_existing_instance(host, port):
+            logging.info("Port freed.")
+        else:
+            _show_error_and_exit(
+                "Port in use",
+                f"Port {port} is held by another process and could not be freed.\n\n"
+                "Either close whatever is using it, or set CORTEX_PORT to a different port.",
+                log_file,
+            )
+            return 1
+
     # Ollama check — clear actionable message if not present.
     ok, msg = _check_ollama(ollama_host)
     if not ok:
@@ -227,8 +317,7 @@ def main() -> int:
             f"Reason: {msg}\n\n"
             "1. Install Ollama from https://ollama.com\n"
             "2. Make sure it's running (it usually starts automatically).\n"
-            "3. Pull the default models on first use:\n"
-            "      ollama pull qwen2.5:7b\n"
+            "3. Make sure your chosen model is pulled (default expects qwen2.5-32b-q4kl):\n"
             "      ollama pull nomic-embed-text\n\n"
             "Then launch Cortex again.",
             log_file,
