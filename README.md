@@ -262,8 +262,8 @@ Until I have fixed this bug, which occurs after closing the executable, you shou
 `sudo ss -ltnp '( sport = :8000 )'`
 
 ##### then kill the PID shown (replace <PID>)
-`sudo kill <PID>        # graceful`
-`sudo kill -9 <PID>     # forceful`
+`sudo kill <PID>        # graceful
+sudo kill -9 <PID>     # forceful`
 
 ##### Alternatively kill by command name (replace pattern):
 
