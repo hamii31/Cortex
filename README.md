@@ -8,7 +8,7 @@ A fully offline chat app for local LLMs via Ollama, with built-in document index
 
 Cortex is a single-file FastAPI app with an embedded HTML UI. It runs a chat interface against any Ollama model, persists conversations to local SQLite, and includes a complete document indexing pipeline so you can ground answers in your own books, papers, and notes.
 
-The name reflects what the app does: it acts as an external cortex — memory (your indexed documents) and reasoning (a local LLM) brought together so you can think through complex material without anything leaving the machine. The default model is `qwen2.5:32b` in Q4_K_M quantization, which sits at roughly 18 GB and runs on a 24 GB GPU with headroom for context. Smaller models work too — see Configuration.
+The name reflects what the app does: it acts as an external cortex — memory (your indexed documents) and reasoning (a local LLM) brought together so you can think through complex material without anything leaving the machine. The default model is `qwen2.5:7b`.
 
 This project pairs naturally with [SmartReader](https://github.com/hamii31/SmartReader) — Cortex reads SmartReader's pickle caches automatically, so books indexed in either app are queryable in Cortex. Cortex is the more recent, more complete tool: it does everything SmartReader does plus chat-style conversations, multi-document attachment, and a wider range of input formats.
 
@@ -34,8 +34,8 @@ This project pairs naturally with [SmartReader](https://github.com/hamii31/Smart
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
 │  │   Indexer    │    │  Retrieval   │    │     Chat     │   │
 │  │              │    │              │    │              │   │
-│  │  PDF/EPUB/   │───▶│  Embed query │───▶│  32B model   │   │
-│  │  DOCX/TXT    │    │  Top-K via   │    │  + RAG       │   │
+│  │  PDF/EPUB/   │───▶│  Embed query │──▶│ qwen2.5 model│   │
+│  │  DOCX/TXT    │    │  Top-K via   │    │    + RAG     │   │
 │  │      ↓       │    │  cosine sim  │    │  context     │   │
 │  │  Chunk +     │    │      ↓       │    │      ↓       │   │
 │  │  embed       │    │  Inject      │    │  Stream to   │   │
@@ -48,7 +48,7 @@ This project pairs naturally with [SmartReader](https://github.com/hamii31/Smart
 │                              ▼                              │
 │                    ┌──────────────────┐                     │
 │                    │  Ollama (local)  │                     │
-│                    │  qwen2.5:32b     │                     │
+│                    │  qwen2.5         │                     │
 │                    │  nomic-embed-text│                     │
 │                    └──────────────────┘                     │
 └─────────────────────────────────────────────────────────────┘
