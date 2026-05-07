@@ -253,6 +253,15 @@ For non-PDF formats, "page" is a soft concept (chapter for EPUB, ~3000-char sect
 
 The default embedding truncates each chunk to 500 characters before embedding (matches SmartReader's behavior so caches are interchangeable). For technical documents with key information past the first 500 characters of a chunk, this can hurt recall. If you want full-text embedding, change `EMBED_TRUNCATE = 500` to `EMBED_TRUNCATE = 2000` near the top of the file and re-index. Be aware: SmartReader caches will no longer be query-equivalent if you do this.
 
+### Processes don't stop by themselves
+
+Sometimes after closing the executable, the port might still be running the process. Until I have fixed that, you should use the following powershell comands to stop the process:
+
+# Find what's listening on port 8000
+Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess
+# Then kill that PID:
+Stop-Process -Id <PID> -Force
+
 ## Privacy and data handling
 
 - All processing is local. No data is sent to any external service.
