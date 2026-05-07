@@ -27,33 +27,6 @@ This project pairs naturally with [SmartReader](https://github.com/hamii31/Smart
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Cortex (FastAPI)                       │
-│                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐   │
-│  │   Indexer    │    │  Retrieval   │    │     Chat     │   │
-│  │              │    │              │    │              │   │
-│  │  PDF/EPUB/   │───▶│  Embed query │──▶│ qwen2.5 model│   │
-│  │  DOCX/TXT    │    │  Top-K via   │    │    + RAG     │   │
-│  │      ↓       │    │  cosine sim  │    │  context     │   │
-│  │  Chunk +     │    │      ↓       │    │      ↓       │   │
-│  │  embed       │    │  Inject      │    │  Stream to   │   │
-│  │      ↓       │    │  excerpts    │    │  browser     │   │
-│  │  .pkl cache  │    │              │    │              │   │
-│  └──────────────┘    └──────────────┘    └──────────────┘   │
-│         │                    │                    │         │
-│         └────────────────────┴────────────────────┘         │
-│                              │                              │
-│                              ▼                              │
-│                    ┌──────────────────┐                     │
-│                    │  Ollama (local)  │                     │
-│                    │  qwen2.5         │                     │
-│                    │  nomic-embed-text│                     │
-│                    └──────────────────┘                     │
-└─────────────────────────────────────────────────────────────┘
-```
-
 The retrieval pipeline:
 
 1. Document arrives via upload or drag-and-drop.
