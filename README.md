@@ -257,9 +257,9 @@ The default embedding truncates each chunk to 500 characters before embedding (m
 
 Sometimes after closing the executable, the port might still be running the process. Until I have fixed that, you should use the following powershell comands to stop the process:
 
-# Find what's listening on port 8000
+**Find what's listening on port 8000**
 Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess
-# Then kill that PID:
+**Then kill that PID:**
 Stop-Process -Id <PID> -Force
 
 ## Privacy and data handling
