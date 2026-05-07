@@ -14,12 +14,12 @@ Cache lives at:
 Setup:
     pip install fastapi uvicorn ollama numpy python-multipart \
                 pypdf ebooklib beautifulsoup4 python-docx
-    ollama pull qwen2.5:32b
+    ollama pull qwen2.5:7b
     ollama pull nomic-embed-text
     python cortex.py
 
 Configure via environment:
-    CORTEX_MODEL=qwen2.5:32b
+    CORTEX_MODEL=qwen2.5:7b              # default; bump to :14b or :32b on bigger GPUs
     CORTEX_EMBED_MODEL=nomic-embed-text
     CORTEX_HOST=127.0.0.1
     CORTEX_PORT=8000
@@ -39,6 +39,7 @@ import pickle
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -54,10 +55,14 @@ from pydantic import BaseModel
 
 
 # === Configuration ========================================================
-MODEL = os.environ.get("CORTEX_MODEL", "qwen2.5:32b")
+MODEL = os.environ.get("CORTEX_MODEL", "qwen2.5:32b-instruct-q4_K_L")
 EMBED_MODEL = os.environ.get("CORTEX_EMBED_MODEL", "nomic-embed-text")
 HOST = os.environ.get("CORTEX_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CORTEX_PORT", "8000"))
+
+# Number of retrieved chunks per query. Smaller models choke on long
+# context — 4 is a safer default for 7B-class models, 6 works well for
+# larger or partially-offloaded models that have more headroom.
 TOP_K = int(os.environ.get("CORTEX_TOP_K", "6"))
 
 CHUNK_SIZE = 1000        # characters per chunk
@@ -292,9 +297,15 @@ def file_hash(path: Path) -> str:
 
 
 def index_file(src_path: Path, book_id: str,
-               progress: Callable[[int, int, str], None]) -> Path:
-    """Run extraction → chunking → embedding → save. Updates progress."""
-    title = src_path.stem
+               progress: Callable[[int, int, str], None],
+               display_title: str | None = None) -> Path:
+    """Run extraction → chunking → embedding → save. Updates progress.
+
+    `display_title` is what the user sees in the library — typically derived
+    from the original upload filename, NOT from src_path (which is a temp
+    file with a UUID prefix). Falls back to src_path.stem if not provided.
+    """
+    title = display_title or src_path.stem
     progress(0, 100, f"Reading {src_path.name}...")
     pages = list(extract(src_path))
     if not pages:
@@ -321,7 +332,8 @@ def index_file(src_path: Path, book_id: str,
     return out
 
 
-async def run_index_job(book_id: str, src_path: Path) -> None:
+async def run_index_job(book_id: str, src_path: Path,
+                        display_title: str | None = None) -> None:
     job = INDEX_JOBS[book_id]
 
     def progress(cur: int, tot: int, msg: str) -> None:
@@ -331,7 +343,9 @@ async def run_index_job(book_id: str, src_path: Path) -> None:
 
     try:
         # Run blocking work off the event loop
-        out_path = await asyncio.to_thread(index_file, src_path, book_id, progress)
+        out_path = await asyncio.to_thread(
+            index_file, src_path, book_id, progress, display_title,
+        )
         job["status"] = "done"
         job["cache_path"] = str(out_path)
         # Refresh in-memory book registry so the new book is queryable
@@ -374,6 +388,9 @@ class Book:
 _BOOKS: dict[str, Book] = {}
 
 
+_LEADING_HEX_PREFIX = re.compile(r"^[0-9a-f]{8}_", re.IGNORECASE)
+
+
 def _title_from_smartreader_stem(stem: str) -> str:
     if stem.endswith("_enhanced"):
         stem = stem[: -len("_enhanced")]
@@ -383,8 +400,12 @@ def _title_from_smartreader_stem(stem: str) -> str:
 
 
 def _title_from_cortex_stem(stem: str) -> str:
+    # Strip trailing 8-char hash separator (our cache filename suffix).
     if len(stem) > 9 and stem[-9] == "_":
         stem = stem[:-9]
+    # Strip leading 8-hex-char prefix that older Cortex builds accidentally
+    # captured from temporary upload filenames. Harmless on new caches.
+    stem = _LEADING_HEX_PREFIX.sub("", stem)
     return stem.replace("_", " ").strip()
 
 
@@ -547,7 +568,13 @@ async def lifespan(app: FastAPI):
         ollama.list()
     except Exception as e:
         print(f"WARN: Ollama not reachable ({e})", file=sys.stderr)
-    yield
+    # Start the idle watchdog — it exits the process if the browser tab
+    # has been closed for ~30 seconds.
+    watchdog_task = asyncio.create_task(_idle_watchdog())
+    try:
+        yield
+    finally:
+        watchdog_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan, title="Cortex")
@@ -562,6 +589,57 @@ def model_info():
         "smartreader_dir": str(SMARTREADER_DIR) if SMARTREADER_DIR else None,
         "supported_ext": sorted(SUPPORTED_EXT),
     }
+
+
+# === Shutdown / heartbeat =================================================
+# The browser is the only "client" of this server. When the user closes the
+# tab, we want the process to exit so port 8000 doesn't stay held and so the
+# next launch isn't blocked. Two mechanisms cooperate:
+#   1. The browser sends a heartbeat every few seconds while the tab is open.
+#   2. A background task watches the heartbeat and exits if it goes silent
+#      for too long.
+# A direct /api/shutdown endpoint also exists for explicit "quit" actions.
+
+import signal as _signal
+_LAST_HEARTBEAT: float = time.time()
+_IDLE_TIMEOUT_SEC: float = 30.0    # exit if no heartbeat for this long
+
+
+@app.post("/api/heartbeat")
+def heartbeat():
+    """Browser pings this every few seconds while the tab is open."""
+    global _LAST_HEARTBEAT
+    _LAST_HEARTBEAT = time.time()
+    return {"ok": True}
+
+
+@app.post("/api/shutdown")
+def shutdown():
+    """Explicit shutdown — used by the JS unload handler."""
+    print("Shutdown requested by client.", file=sys.stderr)
+    # Give FastAPI a moment to send the response before we exit.
+    threading.Timer(0.3, lambda: os.kill(os.getpid(), _signal.SIGTERM)).start()
+    return {"ok": True}
+
+
+async def _idle_watchdog():
+    """Background task that exits the process if heartbeats stop arriving."""
+    global _LAST_HEARTBEAT
+    # Reset on startup so we don't immediately trigger before the browser opens.
+    _LAST_HEARTBEAT = time.time()
+    grace_sec = 60.0   # extra time after startup before watchdog can fire
+    started_at = time.time()
+    while True:
+        await asyncio.sleep(5)
+        if time.time() - started_at < grace_sec:
+            continue
+        if time.time() - _LAST_HEARTBEAT > _IDLE_TIMEOUT_SEC:
+            print(
+                f"No browser heartbeat for {_IDLE_TIMEOUT_SEC}s — shutting down.",
+                file=sys.stderr,
+            )
+            os.kill(os.getpid(), _signal.SIGTERM)
+            return
 
 
 @app.get("/api/library")
@@ -619,7 +697,11 @@ async def upload_document(file: UploadFile = File(...)):
         "status": "running", "progress": 0, "total": 100,
         "message": "Queued...", "filename": name,
     }
-    asyncio.create_task(run_index_job(book_id, tmp_path))
+    # Pass the original (cleaned) filename stem as the display title.
+    # Without this, src_path.stem keeps the UUID prefix from tmp_path
+    # and the library shows titles like "abc12345 mybook" instead of "mybook".
+    display_title = Path(safe_name).stem
+    asyncio.create_task(run_index_job(book_id, tmp_path, display_title))
     return {"book_id": book_id}
 
 
@@ -1432,6 +1514,24 @@ async function init() {
   setupDragDrop();
   setInterval(pollJobs, 1000);
   setInterval(loadLibrary, 30000);
+
+  // === Heartbeat + clean shutdown ========================================
+  // While the tab is open, ping the server every 10 seconds. The server's
+  // watchdog uses this to know the user hasn't closed the tab. If we miss
+  // pings for ~30s the server shuts itself down so port 8000 is freed.
+  fetch('/api/heartbeat', {method:'POST'}).catch(() => {});
+  setInterval(() => {
+    fetch('/api/heartbeat', {method:'POST'}).catch(() => {});
+  }, 10000);
+
+  // When the tab closes (window close, navigation away, refresh), tell the
+  // server explicitly. sendBeacon is the right tool — it fires reliably
+  // during unload where regular fetch() may be cancelled by the browser.
+  window.addEventListener('pagehide', () => {
+    try {
+      navigator.sendBeacon('/api/shutdown');
+    } catch (e) { /* best-effort */ }
+  });
 }
 init();
 </script>
