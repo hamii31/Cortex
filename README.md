@@ -66,33 +66,72 @@ The retrieval pipeline:
 
 ## Requirements
 
-- **Python 3.10+**
 - **Ollama** ([install](https://ollama.com))
 - **~24 GB RAM or VRAM** for the default `qwen2.5:32b` Q4 model
   - Smaller hardware can use `qwen2.5:7b` or `qwen2.5:14b` instead — see Configuration
 - **~3 GB disk** for models (model + embedder)
+- Python 3.10+ only required if running from source
 
 ## Installation
 
+### Option A: Download the executable (recommended)
+
+1. Download the latest `Cortex.exe` (Windows) or `Cortex` binary (Linux/macOS) from the [Releases page](https://github.com/hamii31/Cortex/releases).
+2. Install Ollama from [ollama.com](https://ollama.com) if you haven't already.
+3. Pull the default models the first time:
+   ```bash
+   ollama pull qwen2.5:32b           # ~18 GB, the chat model
+   ollama pull nomic-embed-text      # ~270 MB, for retrieval
+   ```
+4. Double-click the executable. Cortex starts a local server and opens your default browser to the chat UI. If Ollama isn't running, you'll get a dialog explaining what to do.
+
+A log file at `cortex.log` next to the executable captures any errors — useful when filing bug reports.
+
+### Option B: Run from source
+
+For developers, contributors, or anyone who wants to modify Cortex.
+
 ```bash
-# 1. Install Ollama (Linux/macOS)
-curl -fsSL https://ollama.com/install.sh | sh
+# 1. Clone the repo
+git clone https://github.com/hamii31/Cortex.git
+cd Cortex
 
-# Windows: download the installer from https://ollama.com
-
-# 2. Pull the models
-ollama pull qwen2.5:32b           # default chat model (Q4_K_M, ~18 GB)
-ollama pull nomic-embed-text      # embeddings (~270 MB)
+# 2. Install Ollama (see ollama.com), then pull models:
+ollama pull qwen2.5:32b
+ollama pull nomic-embed-text
 
 # 3. Install Python dependencies
 pip install fastapi uvicorn ollama numpy python-multipart \
             pypdf ebooklib beautifulsoup4 python-docx
 
-# 4. Run
+# 4. Run the chat server directly
 python cortex.py
+
+# Or run via the launcher (auto-opens browser, checks Ollama):
+python cortex_launcher.py
 ```
 
-Open [http://localhost:8000](http://localhost:8000) in any browser.
+Open [http://localhost:8000](http://localhost:8000) in any browser if it doesn't open automatically.
+
+### Option C: Build your own executable
+
+If you want to package Cortex yourself — for a custom build, a different platform, or a fork — use the included build script:
+
+```bash
+pip install pyinstaller
+python build_executable.py
+```
+
+The result lands in `dist/Cortex.exe` (Windows), `dist/Cortex` (Linux), or `dist/Cortex.app` (macOS). PyInstaller doesn't cross-compile, so build on the target platform you want to ship.
+
+Build options:
+
+```bash
+python build_executable.py --debug      # keeps the console window visible (useful for diagnosing issues)
+python build_executable.py --onedir     # folder distribution, faster cold start, larger to ship
+```
+
+Place an `icon.ico` (Windows), `icon.icns` (macOS), or `icon.png` (Linux) alongside the build script and it'll be bundled automatically.
 
 ## Usage
 
@@ -159,7 +198,7 @@ Cortex exposes a small REST API. Use it from scripts, other tools, or to integra
 | `POST` | `/api/library/upload` | Upload a document for indexing (multipart/form-data, field `file`) |
 | `GET` | `/api/library/jobs` | All current/recent indexing jobs and their status |
 | `GET` | `/api/library/jobs/{job_id}` | Single job status |
-| `DELETE` | `/api/library/{book_id}` | Remove a document from the library (q4-managed only) |
+| `DELETE` | `/api/library/{book_id}` | Remove a document from the library (Cortex-managed only, not SmartReader imports) |
 | `GET` | `/api/conversations` | List recent conversations |
 | `GET` | `/api/conversations/{cid}` | Get conversation messages and attachments |
 | `DELETE` | `/api/conversations/{cid}` | Delete conversation |
@@ -168,6 +207,20 @@ Cortex exposes a small REST API. Use it from scripts, other tools, or to integra
 | `POST` | `/api/chat` | Send a message; returns SSE stream of tokens (body: `{"conversation_id": "...", "content": "..."}`) |
 
 ## Troubleshooting
+
+### Windows: "Unknown publisher" warning when launching
+
+This is normal for unsigned executables. Click **More info → Run anyway**. Code signing requires a paid certificate (~$200–400/year) which isn't worth it for a personal project; the SmartReader README has the same caveat.
+
+### Antivirus blocks Cortex.exe
+
+PyInstaller-packed executables sometimes trip antivirus heuristics. False positive — whitelist `Cortex.exe` in your antivirus settings, or build from source if you'd rather verify the code yourself.
+
+### Cortex.exe opens and immediately closes (Windows)
+
+Run `Cortex.exe` from a terminal so you can see the error, or check `cortex.log` next to the executable. The most common cause is Ollama not being installed or not running. Install [Ollama](https://ollama.com), make sure it's started, then relaunch Cortex.
+
+If you see an error about `sys.stderr` or `isatty`, you have an old build — rebuild with the latest `cortex_launcher.py`.
 
 ### `Connection error` in the UI
 
