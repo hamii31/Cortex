@@ -8,14 +8,14 @@ A fully offline chat app for local LLMs via Ollama, with built-in document index
 
 Cortex is a single-file FastAPI app with an embedded HTML UI. It runs a chat interface against any Ollama model, persists conversations to local SQLite, and includes a complete document indexing pipeline so you can ground answers in your own books, papers, and notes.
 
-The name reflects what the app does: it acts as an external cortex — memory (your indexed documents) and reasoning (a local LLM) brought together so you can think through complex material without anything leaving the machine. The default model is `qwen2.5:7b`.
+The name reflects what the app does: it acts as an external cortex — memory (your indexed documents) and reasoning (a local LLM) brought together so you can think through complex material without anything leaving the machine.
 
 This project pairs naturally with [SmartReader](https://github.com/hamii31/SmartReader) — Cortex reads SmartReader's pickle caches automatically, so books indexed in either app are queryable in Cortex. Cortex is the more recent, more complete tool: it does everything SmartReader does plus chat-style conversations, multi-document attachment, and a wider range of input formats.
 
 ## Features
 
 - **Fully offline** — once Ollama and the models are installed, no internet is needed.
-- **Single 32B model** — strong reasoning quality from a model that fits a single 24 GB GPU.
+- **Tiered model variants** — separate releases for 7B, 14B, and 32B, so you pick the build that matches your hardware rather than fighting it.
 - **Built-in document indexer** — drag and drop PDF, EPUB, DOCX, TXT, or Markdown.
 - **Drag-and-drop UI** — drop files anywhere on the window to start indexing.
 - **Multi-document RAG** — attach multiple sources to a conversation; retrieval merges across them.
@@ -35,33 +35,61 @@ The retrieval pipeline:
 4. Each chunk is embedded via `nomic-embed-text` (768-dim, embedding the first 500 chars of each chunk).
 5. Chunks are pickled to a local cache directory.
 6. At query time, the question is embedded and cosine similarity ranks all chunks across all attached documents. Top-K are merged by score.
-7. The 32B model receives the retrieved excerpts as a system-attached context block alongside instructions to cite specific pages.
+7. The selected model receives the retrieved excerpts as a system-attached context block alongside instructions to cite specific pages.
 
 ## Requirements
 
 - **Ollama** ([install](https://ollama.com))
 - **GPU/RAM**, depending on the model you want to run:
-  - **8 GB VRAM** for the default `qwen2.5:7b` (the typical mid-range laptop GPU)
+  - **8 GB VRAM** for `qwen2.5:7b` (the typical mid-range laptop GPU)
   - **16 GB VRAM** for `qwen2.5:14b` (noticeably better reasoning)
   - **24 GB VRAM** for `qwen2.5:32b` (the practical ceiling for consumer hardware)
   - Lower VRAM still works via Ollama's CPU/GPU split, but expect slow generation
-- **~5 GB disk** for default models (chat + embedder)
+- **~5 GB disk** for the smallest tier (chat + embedder); ~20 GB for the Research tier
 - Python 3.10+ only required if running from source
 
 ## Installation
 
 ### Option A: Download the executable (recommended)
 
-1. Download the latest `Cortex.exe` (Windows) or `Cortex` binary (Linux/macOS) from the [Releases page](https://github.com/hamii31/Cortex/releases).
-2. Install Ollama from [ollama.com](https://ollama.com) if you haven't already.
-3. Pull the default models the first time:
-   ```bash
-   ollama pull qwen2.5:7b            # ~4.7 GB, the default chat model
-   ollama pull nomic-embed-text      # ~270 MB, for retrieval
-   ```
-4. Double-click the executable. Cortex starts a local server and opens your default browser to the chat UI. If Ollama isn't running, you'll get a dialog explaining what to do.
+Cortex ships in three tiers. **Pick the one that matches your hardware**:
+
+| Build | Model | Min VRAM | Best for |
+|---|---|---|---|
+| **Cortex 7B** | `qwen2.5:7b` | 8 GB | Laptops, fast responses, daily use |
+| **Cortex 14B** ← *recommended for most users* | `qwen2.5:14b` | 16 GB | Balanced — strong quality at usable speed |
+| **Cortex 32B (Research)** | `qwen2.5:32b` Q4_K_L | 24 GB or 32 GB system RAM | Researchers; highest precision on technical text |
+
+**Steps:**
+
+1. Download the matching `.exe` from the [Releases page](https://github.com/hamii31/Cortex/releases).
+2. Install [Ollama](https://ollama.com) if you haven't already.
+3. Pull the embedder and the model that matches your build:
+
+```bash
+   ollama pull nomic-embed-text                  # for all builds (~270 MB)
+
+   # Then ONE of these, matching your downloaded build:
+   ollama pull qwen2.5:7b                        # for Cortex 7B
+   ollama pull qwen2.5:14b                       # for Cortex 14B
+   ollama pull hf.co/bartowski/Qwen2.5-32B-Instruct-GGUF:Q4_K_L     # for Cortex 32B Research
+```
+
+4. (32B Research only) Tag the HuggingFace model with the short name Cortex expects:
+
+```bash
+   ollama cp hf.co/bartowski/Qwen2.5-32B-Instruct-GGUF:Q4_K_L qwen2.5-32b-q4kl
+```
+
+5. Double-click the executable. Cortex starts a local server and opens your default browser to the chat UI. If Ollama isn't running, you'll get a dialog explaining what to do.
 
 A log file at `cortex.log` next to the executable captures any errors — useful when filing bug reports.
+
+#### About the Research variant
+
+The 32B Research build uses the Q4_K_L quantization rather than the standard Q4_K_M. Both are 4-bit, but Q4_K_L preserves higher precision (Q6_K) on token embeddings and the output projection — the layers most responsible for vocabulary handling and final answer quality. The practical effect is sharper handling of specialized terminology and rare tokens, which matters for technical and academic content. The model is ~1 GB larger than standard Q4_K_M.
+
+If you have 24 GB+ VRAM, this is the strongest 4-bit Cortex build available. If you have 8–16 GB VRAM, you can still run it via CPU offload — expect 2–5 tokens/sec — which suits research workflows where you ask deep questions and don't mind waiting for thoughtful answers.
 
 ### Option B: Run from source
 
@@ -117,12 +145,12 @@ Drag any supported file into the Cortex window. A progress bar appears in the si
 
 Supported formats:
 
-| Format | Page semantics | Library tag |
+| Format | Page semantics | Source |
 |---|---|---|
-| `.pdf` | Real PDF page numbers | `q4` |
-| `.epub` | Chapter index (no real pages exist in EPUB) | `q4` |
-| `.docx` | Pseudo-pages of ~3000 characters | `q4` |
-| `.txt`, `.md` | Pseudo-pages of ~3000 characters | `q4` |
+| `.pdf` | Real PDF page numbers | Cortex (default, no tag shown) |
+| `.epub` | Chapter index (no real pages exist in EPUB) | Cortex |
+| `.docx` | Pseudo-pages of ~3000 characters | Cortex |
+| `.txt`, `.md` | Pseudo-pages of ~3000 characters | Cortex |
 | SmartReader cache | Whatever SmartReader stored | `sr` (read-only) |
 
 ### Asking a question
@@ -145,7 +173,7 @@ Configure via environment variables before launching:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `CORTEX_MODEL` | `qwen2.5:7b` | Any Ollama model. Bump to `qwen2.5:14b` on 16 GB GPUs or `qwen2.5:32b` on 24 GB GPUs for noticeably stronger reasoning. `llama3.3:70b` is the high end for 40+ GB hardware. |
+| `CORTEX_MODEL` | depends on the build (`qwen2.5:7b`, `qwen2.5:14b`, or `qwen2.5-32b-q4kl`) | Override to use any Ollama model name. Run `ollama list` to see what's available. |
 | `CORTEX_EMBED_MODEL` | `nomic-embed-text` | Embedding model used for both indexing and retrieval. Must be available in Ollama. |
 | `CORTEX_HOST` | `127.0.0.1` | Set to `0.0.0.0` to expose to your local network (no auth — be careful). |
 | `CORTEX_PORT` | `8000` | HTTP port. |
@@ -212,11 +240,13 @@ Embedding throughput is the bottleneck and runs through Ollama. A 900-page book 
 
 ### CUDA error 500 / "shared object initialization failed"
 
-The model is too big for your GPU. Either use a smaller model (`CORTEX_MODEL=qwen2.5:7b`) or restart Ollama and let it auto-tune the GPU/CPU split. The 7B default fits 8 GB VRAM cleanly; 14B needs 16 GB and 32B needs 24 GB. If you've recently crashed the runner, restart Ollama (right-click the tray icon → Quit, then start again) before retrying — the GPU context can stay in a bad state until Ollama is fully restarted.
+The model is too big for your GPU. Download a smaller Cortex tier from the Releases page (7B for 8 GB GPUs, 14B for 16 GB, 32B for 24 GB) — the right tier matters more than tuning. If you've recently crashed the Ollama runner, restart it (right-click the tray icon → Quit, then start again) before retrying — the GPU context can stay in a bad state until Ollama is fully restarted.
+
+For the 32B Research build on partial-offload hardware (8–16 GB VRAM, 32+ GB system RAM): expect 2–5 tokens/sec. This is normal and not a bug — Ollama is running most of the model on CPU. If the speed is unacceptable, drop down to the 14B build.
 
 ### Out of memory on the chat model
 
-Switch to a smaller model: `CORTEX_MODEL=qwen2.5:7b cortex.exe` (or just rely on the default). For very tight VRAM, even `gemma2:2b` works. Quality drops but the app is identical.
+Switch to a smaller tier from the Releases page, or override at launch: `CORTEX_MODEL=qwen2.5:7b cortex.exe`. For very tight VRAM, even `gemma2:2b` works. Quality drops but the app is identical.
 
 ### Citations point to wrong pages
 
@@ -238,8 +268,8 @@ sudo ss -ltnp '( sport = :8000 )'
 
 ##### then kill the PID shown (replace <PID>)
 ```bash
-sudo kill <PID>        # graceful
-sudo kill -9 <PID>     # forceful
+sudo kill         # graceful
+sudo kill -9      # forceful
 ```
 
 ##### Alternatively kill by command name (replace pattern):
@@ -255,7 +285,7 @@ Get-NetTCPConnection -LocalPort 8000 | Select-Object OwningProcess
 
 ##### Then kill that PID:
 ```bash
-Stop-Process -Id <PID> -Force
+Stop-Process -Id  -Force
 ```
 
 ## Privacy and data handling
@@ -275,4 +305,4 @@ MIT.
 - [Ollama](https://ollama.com) for the local LLM runtime.
 - [SmartReader](https://github.com/hamii31/SmartReader) for establishing the offline RAG pattern this project extends.
 - The Qwen, Llama, and DeepSeek teams for open-weight models that make this practical.
-- [nomic-embed-text](https://www.nomic.ai/blog/posts/nomic-embed-text-v1) for embeddings.
+- [nomic-embed-text](https://www.nomic.ai/blog/posts/nomic-embed-text-v1) for embedd
