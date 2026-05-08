@@ -2,7 +2,7 @@
 
 A fully offline chat app for local LLMs via Ollama, with built-in document indexing and retrieval-augmented generation. Drop a PDF, EPUB, DOCX, or text file into the window, attach it to a conversation, and query it with a model of your choice running on your own hardware. No cloud, no telemetry, no internet required after setup.
 
-![offline](https://img.shields.io/badge/offline-yes-67e480?style=flat-square) ![ollama](https://img.shields.io/badge/runtime-ollama-5dd9ff?style=flat-square) ![rag](https://img.shields.io/badge/RAG-built--in-ff9d5d?style=flat-square) [![DOI](https://zenodo.org/badge/1231694841.svg)](https://doi.org/10.5281/zenodo.20069615)
+![offline](https://img.shields.io/badge/offline-yes-67e480?style=flat-square) ![ollama](https://img.shields.io/badge/runtime-ollama-5dd9ff?style=flat-square) ![rag](https://img.shields.io/badge/RAG-built--in-ff9d5d?style=flat-square) [![DOI](https://zenodo.org/badge/1231694841.svg)](https://doi.org/10.5281/zenodo.20069615) [![Downloads](https://img.shields.io/github/downloads/hamii31/Cortex/total?style=flat-square)](https://github.com/hamii31/Cortex/releases)
 
 ## What it is
 
@@ -245,7 +245,7 @@ For the 32B Research build on partial-offload hardware (8–16 GB VRAM, 32+ GB s
 
 ### Out of memory on the chat model
 
-Switch to a smaller tier from the Releases page, or override at launch: `CORTEX_MODEL=qwen2.5:7b cortex.exe`. For very tight VRAM, even `gemma2:2b` works. Quality drops but the app is identical.
+Switch to a smaller tier from the Releases page, or override at launch: `CORTEX_MODEL=qwen2.5:7b cortex.exe`.
 
 ### Citations point to wrong pages
 
