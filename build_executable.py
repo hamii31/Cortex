@@ -29,12 +29,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from cortex import MODEL
 
 ROOT = Path(__file__).resolve().parent
 ENTRY = ROOT / "cortex_launcher.py"
 APP_NAME = "Cortex"
-MODEL = MODEL
 
 
 def check_pyinstaller() -> None:
@@ -186,7 +184,7 @@ def report_output(onefile: bool) -> None:
     print("\nUsers still need to install Ollama separately:")
     print("  https://ollama.com")
     print("Then pull the models the first time:")
-    print(f"  ollama pull {MODEL}")
+    print("  ollama pull qwen2.5:7b qwen2.5:14b hf.co/bartowski/Qwen2.5-32B-Instruct-GGUF:Qwen2.5-32B-Instruct-Q4_K_L.gguf ")
     print("  ollama pull nomic-embed-text")
 
 
