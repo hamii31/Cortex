@@ -55,15 +55,124 @@ from pydantic import BaseModel
 
 
 # === Configuration ========================================================
-MODEL = os.environ.get("CORTEX_MODEL", "qwen2.5:32b-instruct-q4_K_L")
+# === Model tiers ==========================================================
+# Cortex ships with three model tiers in a single executable. Users select
+# at runtime via the UI dropdown; the choice persists across launches via
+# a small JSON file alongside the conversation DB.
+#
+# Each tier has:
+#   id:            stable identifier used by the UI and config
+#   ollama_name:   the actual Ollama model tag to call
+#   label:         display name in the UI
+#   description:   tooltip / detail line
+#   tier:          numeric capability ranking (1=lite, 2=standard, 3=research)
+#                  used by mode gating to hide scaffolds the model can't handle
+#   recommended_top_k: per-tier retrieval default
+
+MODEL_TIERS: dict[str, dict] = {
+    "lite": {
+        "ollama_name": "qwen2.5:7b",
+        "label": "Lite (7B)",
+        "description": "Fast, fits 8 GB VRAM. Good for quick lookups and RAG-grounded queries.",
+        "tier": 1,
+        "recommended_top_k": 4,
+    },
+    "standard": {
+        "ollama_name": "qwen2.5:14b",
+        "label": "Standard (14B)",
+        "description": "Balanced. Needs ~10 GB VRAM. Stronger reasoning than 7B at usable speed.",
+        "tier": 2,
+        "recommended_top_k": 6,
+    },
+    "research": {
+        "ollama_name": "qwen2.5:32b-instruct-q4_K_L",
+        "label": "Research (32B Q4_K_L)",
+        "description": "Highest precision. Needs 24 GB VRAM for full speed, or 32+ GB system RAM for slow CPU offload.",
+        "tier": 3,
+        "recommended_top_k": 6,
+    },
+}
+
+DEFAULT_TIER = os.environ.get("CORTEX_DEFAULT_TIER", "lite")
+if DEFAULT_TIER not in MODEL_TIERS:
+    DEFAULT_TIER = "lite"
+
+
+# Runtime state for the active model. Persisted to disk so the user's
+# choice survives restarts. The legacy CORTEX_MODEL env var still works
+# for power users — it overrides the tier system entirely with a raw
+# Ollama model name.
+_ACTIVE_TIER: str = DEFAULT_TIER
+_OVERRIDE_MODEL: str | None = os.environ.get("CORTEX_MODEL")  # if set, bypasses tiers
+
+
+def _state_file() -> Path:
+    return LIBRARY_DIR.parent / "cortex_state.json"
+
+
+def _load_active_tier() -> None:
+    """Read the persisted tier choice from disk, fall back to default."""
+    global _ACTIVE_TIER
+    if _OVERRIDE_MODEL:
+        return  # env override wins, ignore persisted state
+    try:
+        f = _state_file()
+        if f.exists():
+            data = json.loads(f.read_text())
+            tier = data.get("active_tier")
+            if tier in MODEL_TIERS:
+                _ACTIVE_TIER = tier
+    except Exception:
+        pass
+
+
+def _save_active_tier(tier: str) -> None:
+    """Persist the user's tier choice."""
+    try:
+        f = _state_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"active_tier": tier}))
+    except Exception as e:
+        print(f"WARN: could not persist tier: {e}", file=sys.stderr)
+
+
+def active_model_name() -> str:
+    """Return the Ollama model name to call right now."""
+    if _OVERRIDE_MODEL:
+        return _OVERRIDE_MODEL
+    return MODEL_TIERS[_ACTIVE_TIER]["ollama_name"]
+
+
+def active_tier_info() -> dict:
+    """Return descriptive info about the currently active model."""
+    if _OVERRIDE_MODEL:
+        return {
+            "id": "custom",
+            "ollama_name": _OVERRIDE_MODEL,
+            "label": _OVERRIDE_MODEL,
+            "description": "Custom model set via CORTEX_MODEL env var.",
+            "tier": 3,  # treat custom as full-capability for mode gating
+            "recommended_top_k": int(os.environ.get("CORTEX_TOP_K", "6")),
+        }
+    return {"id": _ACTIVE_TIER, **MODEL_TIERS[_ACTIVE_TIER]}
+
+
 EMBED_MODEL = os.environ.get("CORTEX_EMBED_MODEL", "nomic-embed-text")
 HOST = os.environ.get("CORTEX_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CORTEX_PORT", "8000"))
 
-# Number of retrieved chunks per query. Smaller models choke on long
-# context — 4 is a safer default for 7B-class models, 6 works well for
-# larger or partially-offloaded models that have more headroom.
-TOP_K = int(os.environ.get("CORTEX_TOP_K", "6"))
+
+def active_top_k() -> int:
+    """Resolve the retrieval count for the currently active model.
+    Honors CORTEX_TOP_K override if set, otherwise uses the tier's recommendation."""
+    env_override = os.environ.get("CORTEX_TOP_K")
+    if env_override:
+        try:
+            return int(env_override)
+        except ValueError:
+            pass
+    return active_tier_info()["recommended_top_k"]
+
 
 CHUNK_SIZE = 1000        # characters per chunk
 CHUNK_OVERLAP = 200      # overlap between adjacent chunks
@@ -445,27 +554,88 @@ def ensure_loaded(book_id: str) -> Book | None:
     return book
 
 
-def retrieve(book_ids: list[str], query: str, top_k: int = TOP_K) -> list[dict]:
+def retrieve(book_ids: list[str], query: str, top_k: int | None = None) -> list[dict]:
+    """Retrieve top-K chunks across all attached books.
+
+    When multiple books are attached, this guarantees each book contributes
+    at least one chunk to the result set (assuming it has any chunks at all).
+    Without this guarantee, a single book that happens to score slightly
+    higher on a query can monopolize all K slots, leaving the other books
+    invisible to the model — which is the cause of the "model only cites
+    the first book" symptom.
+
+    Algorithm:
+      1. Score every chunk in every attached book against the query.
+      2. Reserve `min_per_book` slots per book (taking each book's top
+         chunks for its reserved share).
+      3. Fill remaining slots from the global pool, skipping anything
+         already reserved.
+      4. Re-sort the final result by score so the highest-relevance
+         chunk appears first regardless of source.
+    """
     if not book_ids:
         return []
+    if top_k is None:
+        top_k = active_top_k()
     qvec = embed_query(query)
     if qvec is None:
         return []
-    pool: list[tuple[float, str, TextChunk]] = []
+
+    # Per-book scored chunks: {book_id: [(score, title, chunk), ...]}
+    by_book: dict[str, list[tuple[float, str, TextChunk]]] = {}
     for bid in book_ids:
         book = ensure_loaded(bid)
         if not book or book.matrix is None:
             continue
         scores = book.matrix @ qvec
-        k = min(top_k, len(scores))
-        idx = np.argpartition(-scores, k - 1)[:k]
-        for i in idx:
-            pool.append((float(scores[i]), book.title, book.chunks[i]))
-    pool.sort(key=lambda t: t[0], reverse=True)
-    pool = pool[:top_k]
+        # Sort descending — full sort is fine, books rarely have >50k chunks
+        order = np.argsort(-scores)
+        by_book[bid] = [
+            (float(scores[i]), book.title, book.chunks[i])
+            for i in order
+        ]
+
+    if not by_book:
+        return []
+
+    # Single-book case: just take the top-K. No reservation needed.
+    if len(by_book) == 1:
+        only = next(iter(by_book.values()))
+        result = only[:top_k]
+        return [
+            {"score": s, "book": title, "page": chunk.page_number, "text": chunk.text}
+            for s, title, chunk in result
+        ]
+
+    # Multi-book case: reserve at least 1 chunk per book, then fill.
+    # Cap reservations so we don't end up with more reserved slots than top_k.
+    n_books = len(by_book)
+    min_per_book = max(1, top_k // (n_books * 2))   # at least 1, more if top_k is large
+    min_per_book = min(min_per_book, top_k // n_books)  # never starve the global pool
+
+    reserved: list[tuple[float, str, TextChunk]] = []
+    seen: set[int] = set()  # chunk identity by id() to avoid double-picking
+    for bid, scored in by_book.items():
+        for entry in scored[:min_per_book]:
+            reserved.append(entry)
+            seen.add(id(entry[2]))
+
+    # Build the global pool of remaining candidates and fill the rest.
+    remaining_slots = max(0, top_k - len(reserved))
+    global_pool: list[tuple[float, str, TextChunk]] = []
+    for scored in by_book.values():
+        for entry in scored:
+            if id(entry[2]) in seen:
+                continue
+            global_pool.append(entry)
+    global_pool.sort(key=lambda t: t[0], reverse=True)
+
+    final = reserved + global_pool[:remaining_slots]
+    final.sort(key=lambda t: t[0], reverse=True)
+
     return [
         {"score": s, "book": title, "page": chunk.page_number, "text": chunk.text}
-        for s, title, chunk in pool
+        for s, title, chunk in final
     ]
 
 
@@ -528,25 +698,144 @@ Rules:
 - For non-PDF sources, "p. N" maps to chapter (EPUB) or section (DOCX/text) — cite it the same way.
 - If the excerpts don't contain the answer, say so plainly. Do not invent citations or fill gaps with general knowledge presented as if it came from the source.
 - You may use general knowledge to frame or connect what the excerpts say, but be explicit when doing so.
-- If excerpts contradict each other, point that out instead of forcing a synthesis."""
+- If excerpts contradict each other, point that out instead of forcing a synthesis.
+- When MULTIPLE sources are attached, draw from all of them — not just the first one you read. The retrieved excerpts come from different books and may cover complementary aspects of the question. Cite each source you use explicitly. If you only end up citing one source, briefly note whether the other sources had relevant material or simply didn't address the question."""
 
 
 def format_rag_context(chunks: list[dict]) -> str:
     if not chunks:
         return ""
+
+    # When multiple distinct sources are present, surface that explicitly at
+    # the top so the model doesn't anchor on the first source it sees.
+    sources = sorted({c["book"] for c in chunks})
+    if len(sources) > 1:
+        header = (
+            f"Retrieved excerpts from {len(sources)} attached sources: "
+            f"{', '.join(sources)}.\n"
+            "Each excerpt below is labeled with its source — consider all of them.\n\n"
+        )
+    else:
+        header = "Retrieved excerpts from attached sources:\n\n"
+
     blocks = []
     for i, c in enumerate(chunks, 1):
         blocks.append(
             f"[Excerpt {i}] {c['book']}, p. {c['page']} (relevance {c['score']:.2f})\n"
             f"{c['text'].strip()}"
         )
-    return "Retrieved excerpts from attached sources:\n\n" + "\n\n---\n\n".join(blocks)
+    return header + "\n\n---\n\n".join(blocks)
+
+
+# === Reasoning modes ======================================================
+# Modes prepend a scaffold instruction to the user's question. The scaffold
+# forces the model to produce structured intermediate output before its
+# prose answer — this dramatically improves the quality of complex queries
+# on small/medium local models, which otherwise tend to skip steps and
+# anchor on the first piece of evidence they read.
+#
+# Each mode has:
+#   id:          stable identifier used by the UI and API
+#   label:       short name for the UI dropdown
+#   description: tooltip text explaining when to use it
+#   scaffold:    instruction injected into the user message
+#
+# To add a new mode, append an entry. The frontend picks them up automatically
+# via /api/modes.
+
+MODES: dict[str, dict] = {
+    "default": {
+        "label": "Default",
+        "description": "Direct answer with no extra scaffolding. Best for simple lookups, factual questions, and casual conversation.",
+        "min_tier": 1,
+        "scaffold": "",
+    },
+    "compare": {
+        "label": "Compare",
+        "description": "Forces a structured comparison before the prose answer. Use for 'A vs B', 'best approach', 'tradeoffs', or any question with multiple options.",
+        "min_tier": 1,
+        "scaffold": (
+            "This question involves comparing options or weighing tradeoffs. "
+            "Before your prose answer, produce a markdown comparison table:\n"
+            "  - Rows = the options being compared\n"
+            "  - Columns = the criteria that matter for this question\n"
+            "  - Cells = concrete ratings, values, or short notes (not just 'good/bad')\n"
+            "Then write a prose synthesis below the table that draws conclusions "
+            "from it. Cite sources where applicable. If a cell can't be filled "
+            "from your knowledge or the attached sources, write 'unknown' rather "
+            "than guessing."
+        ),
+    },
+    "process": {
+        "label": "Process",
+        "description": "Forces an explicit state/step layout before the prose explanation. Use for 'how does X work', 'what's the flow', biological pathways, algorithms, or system dynamics.",
+        "min_tier": 2,
+        "scaffold": (
+            "This question is about a process, system, or sequence over time. "
+            "Before your prose answer, produce a structured outline:\n"
+            "  1. List the distinct states, stages, or steps involved\n"
+            "  2. For each: what triggers entry into it, what happens during it, "
+            "what causes the transition out\n"
+            "  3. Note any feedback loops or branching points explicitly\n"
+            "Format as a numbered list or small table. Then write the prose "
+            "explanation below, referring back to the structure you laid out. "
+            "Cite sources where applicable."
+        ),
+    },
+    "cross_source": {
+        "label": "Cross-source",
+        "description": "Forces explicit cross-referencing across all attached documents before the answer. Use when multiple books are attached and you want them all considered. Best on 14B+ models.",
+        "min_tier": 2,
+        "scaffold": (
+            "Multiple sources are attached. Before your prose answer, produce a "
+            "cross-reference table:\n"
+            "  - Rows = the key claims relevant to the question\n"
+            "  - Columns = each attached source\n"
+            "  - Cells = which source supports the claim (with page), 'silent' "
+            "if a source doesn't address it, or 'contradicts' with a brief note "
+            "if a source disagrees\n"
+            "Then write the prose answer, drawing from ALL sources that have "
+            "something to contribute. If a source ended up being silent on every "
+            "relevant claim, say so explicitly at the end of your answer."
+        ),
+    },
+    "critique": {
+        "label": "Critique",
+        "description": "Forces a structured strengths/weaknesses analysis before recommendations. Use for reviewing a plan, paper, code design, or proposal. Best on 14B+ models.",
+        "min_tier": 2,
+        "scaffold": (
+            "This question asks for evaluation or critique. Before your prose "
+            "response, produce a structured analysis:\n"
+            "  - Strengths: what works, with specific reasons\n"
+            "  - Weaknesses: what's flawed or risky, with specific reasons\n"
+            "  - Unknowns: what you can't evaluate without more information\n"
+            "  - Recommendations: concrete changes, ordered by importance\n"
+            "Use bullet points with at least one specific example per item. "
+            "Avoid vague critique like 'could be clearer' — say what specifically "
+            "is unclear and why. Then write a prose summary below."
+        ),
+    },
+}
+
+DEFAULT_MODE = "default"
+
+
+def apply_mode(user_content: str, mode_id: str) -> str:
+    """Wrap a user message with the chosen mode's scaffold instruction."""
+    mode = MODES.get(mode_id) or MODES[DEFAULT_MODE]
+    scaffold = mode.get("scaffold", "")
+    if not scaffold:
+        return user_content
+    # The scaffold goes BEFORE the question so the model reads instructions
+    # first, then sees the question through that lens.
+    return f"{scaffold}\n\n---\n\n{user_content}"
 
 
 # === API schemas ==========================================================
 class ChatRequest(BaseModel):
     conversation_id: str | None = None
     content: str
+    mode: str = DEFAULT_MODE
 
 
 class AttachRequest(BaseModel):
@@ -558,8 +847,10 @@ class AttachRequest(BaseModel):
 async def lifespan(app: FastAPI):
     LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
     _db_init()
+    _load_active_tier()
     discover_books()
-    print(f"Cortex: model={MODEL} embed={EMBED_MODEL}", file=sys.stderr)
+    info = active_tier_info()
+    print(f"Cortex: model={active_model_name()} (tier: {info['label']}) embed={EMBED_MODEL}", file=sys.stderr)
     print(f"  library: {LIBRARY_DIR}", file=sys.stderr)
     if SMARTREADER_DIR:
         print(f"  smartreader: {SMARTREADER_DIR} (read-only)", file=sys.stderr)
@@ -582,12 +873,178 @@ app = FastAPI(lifespan=lifespan, title="Cortex")
 
 @app.get("/api/model")
 def model_info():
+    info = active_tier_info()
     return {
-        "model": MODEL,
+        "model": active_model_name(),
+        "tier_id": info["id"],
+        "tier_label": info["label"],
+        "tier_description": info["description"],
+        "tier_rank": info["tier"],
         "embed_model": EMBED_MODEL,
         "library_dir": str(LIBRARY_DIR),
         "smartreader_dir": str(SMARTREADER_DIR) if SMARTREADER_DIR else None,
         "supported_ext": sorted(SUPPORTED_EXT),
+        "override_active": _OVERRIDE_MODEL is not None,
+    }
+
+
+@app.get("/api/model/tiers")
+def list_tiers():
+    """Return the available model tiers for the UI dropdown.
+    The current active tier is also returned so the UI can highlight it."""
+    info = active_tier_info()
+    return {
+        "active": info["id"],
+        "override_active": _OVERRIDE_MODEL is not None,
+        "tiers": [
+            {
+                "id": tid,
+                "ollama_name": t["ollama_name"],
+                "label": t["label"],
+                "description": t["description"],
+                "tier": t["tier"],
+            }
+            for tid, t in MODEL_TIERS.items()
+        ],
+    }
+
+
+class TierSwitchRequest(BaseModel):
+    tier: str
+
+
+def _list_installed_ollama_models() -> list[str]:
+    """Return the list of installed Ollama model names.
+
+    Different versions of the Ollama Python client return different shapes:
+      - Older versions: dict with 'models' list, each model has 'name' key
+      - Newer versions: ListResponse object with .models attribute, each
+        Model has .model attribute (note: 'model', not 'name')
+      - Some versions populate both fields, some only one
+    This helper tries every shape so the rest of the code doesn't have to care.
+    """
+    try:
+        raw = ollama.list()
+    except Exception as e:
+        print(f"WARN: ollama.list() failed: {e}", file=sys.stderr)
+        return []
+
+    # Find the 'models' container — could be a dict key or an attribute
+    if hasattr(raw, "models"):
+        models = raw.models
+    elif isinstance(raw, dict):
+        models = raw.get("models", [])
+    else:
+        return []
+
+    names: list[str] = []
+    for m in models:
+        # Try dict access first (works for older clients and dict-shaped items)
+        name = ""
+        if isinstance(m, dict):
+            name = m.get("model") or m.get("name") or ""
+        else:
+            # Object form — try both attribute names
+            name = (
+                getattr(m, "model", None)
+                or getattr(m, "name", None)
+                or ""
+            )
+        if name:
+            names.append(str(name))
+    return names
+
+
+@app.get("/api/ollama/installed")
+def ollama_installed_models():
+    """List models currently installed in the local Ollama. Used by the
+    tier menu to show which tiers are ready to use vs. need to be pulled."""
+    return {"names": _list_installed_ollama_models()}
+
+
+@app.post("/api/model/switch")
+def switch_tier(body: TierSwitchRequest):
+    """Switch the active model tier. Verifies the model is actually pulled
+    in Ollama before committing, so users get a clear error rather than a
+    cryptic failure mid-query."""
+    global _ACTIVE_TIER
+    if _OVERRIDE_MODEL is not None:
+        raise HTTPException(
+            400,
+            "CORTEX_MODEL env var is set — tier switching disabled. "
+            "Unset CORTEX_MODEL to use the tier UI.",
+        )
+    if body.tier not in MODEL_TIERS:
+        raise HTTPException(404, f"unknown tier: {body.tier}")
+
+    target_name = MODEL_TIERS[body.tier]["ollama_name"]
+
+    # Verify the target model exists in the local Ollama before switching.
+    # Match is intentionally lenient about formatting variations Ollama
+    # introduces (case, trailing :latest, .gguf suffix) but strict about
+    # the actual model identity — we don't want "qwen2.5:14b" to match
+    # "qwen2.5:7b" just because they share the "qwen2.5" prefix.
+    installed_names = _list_installed_ollama_models()
+
+    def _norm(s: str) -> str:
+        s = s.lower().strip()
+        if s.endswith(".gguf"):
+            s = s[:-5]
+        if s.endswith(":latest"):
+            s = s[:-7]
+        return s
+
+    target_norm = _norm(target_name)
+    # If the configured name has no tag (e.g. just "qwen2.5-32b-q4kl"),
+    # an installed copy with any tag is acceptable. If it has a tag,
+    # the tag must match.
+    target_has_tag = ":" in target_norm
+
+    def _is_match(installed: str) -> bool:
+        n = _norm(installed)
+        if n == target_norm:
+            return True
+        if not target_has_tag and n.startswith(target_norm + ":"):
+            return True
+        return False
+
+    match = any(_is_match(n) for n in installed_names)
+
+    if not match:
+        installed_summary = ", ".join(installed_names[:6]) or "(none detected)"
+        if len(installed_names) > 6:
+            installed_summary += f", ... and {len(installed_names) - 6} more"
+        raise HTTPException(
+            400,
+            f"Model '{target_name}' is not installed in Ollama. "
+            f"Pull it first: ollama pull {target_name}\n\n"
+            f"Currently installed: {installed_summary}",
+        )
+
+    _ACTIVE_TIER = body.tier
+    _save_active_tier(body.tier)
+    print(f"Switched to tier '{body.tier}' (model: {target_name})", file=sys.stderr)
+    return {"ok": True, "active": body.tier, "model": target_name}
+
+
+@app.get("/api/modes")
+def list_modes():
+    """Return the available reasoning modes for the UI dropdown.
+    Includes the active model's tier rank so the frontend can dim or hide
+    modes the current model isn't strong enough to handle well."""
+    info = active_tier_info()
+    return {
+        "default": DEFAULT_MODE,
+        "current_tier_rank": info["tier"],
+        "modes": [
+            {
+                "id": mid,
+                "label": m["label"],
+                "description": m["description"],
+                "min_tier": m.get("min_tier", 1),
+            }
+            for mid, m in MODES.items()
+        ],
     }
 
 
@@ -829,14 +1286,35 @@ async def chat(req: ChatRequest):
         )
 
     book_ids = get_attachments(cid)
-    rag_chunks: list[dict] = retrieve(book_ids, req.content, TOP_K) if book_ids else []
+    rag_chunks: list[dict] = retrieve(book_ids, req.content, active_top_k()) if book_ids else []
+
+    # Resolve the mode. If the user picked Default but multiple sources are
+    # attached AND retrieval pulled from more than one, AND the active model
+    # is strong enough (tier 2+), nudge toward cross_source. On the Lite tier
+    # we leave it alone — 7B can't reliably fill a cross-reference table.
+    requested_mode = req.mode if req.mode in MODES else DEFAULT_MODE
+    distinct_sources = {c["book"] for c in rag_chunks}
+    current_tier_rank = active_tier_info()["tier"]
+    effective_mode = requested_mode
+    if (requested_mode == DEFAULT_MODE
+            and len(distinct_sources) > 1
+            and current_tier_rank >= MODES["cross_source"]["min_tier"]):
+        effective_mode = "cross_source"
+
+    # Build the question with the mode scaffold applied.
+    # Guard against picking a mode the active model can't handle (e.g. user
+    # switched from Standard to Lite mid-conversation while Compare was selected).
+    chosen_mode_def = MODES.get(effective_mode, MODES[DEFAULT_MODE])
+    if chosen_mode_def.get("min_tier", 1) > current_tier_rank:
+        effective_mode = DEFAULT_MODE
+    scaffolded_question = apply_mode(req.content, effective_mode)
 
     if rag_chunks:
         system_prompt = SYSTEM_BASE + SYSTEM_RAG_SUFFIX
-        user_message = f"{format_rag_context(rag_chunks)}\n\n---\n\nQuestion: {req.content}"
+        user_message = f"{format_rag_context(rag_chunks)}\n\n---\n\nQuestion: {scaffolded_question}"
     else:
         system_prompt = SYSTEM_BASE
-        user_message = req.content
+        user_message = scaffolded_question
 
     full_messages = (
         [{"role": "system", "content": system_prompt}]
@@ -844,9 +1322,19 @@ async def chat(req: ChatRequest):
         + [{"role": "user", "content": user_message}]
     )
 
+    # Capture model name once at request time so a mid-stream switch doesn't
+    # affect this in-flight query.
+    model_for_request = active_model_name()
+
     async def event_stream() -> AsyncIterator[str]:
         yield _sse({
-            "type": "meta", "conversation_id": cid, "model": MODEL,
+            "type": "meta", "conversation_id": cid, "model": model_for_request,
+            "mode": {
+                "requested": requested_mode,
+                "effective": effective_mode,
+                "auto_promoted": requested_mode != effective_mode,
+                "label": MODES.get(effective_mode, {}).get("label", effective_mode),
+            },
             "rag": {
                 "active": bool(rag_chunks),
                 "chunks": [
@@ -859,7 +1347,7 @@ async def chat(req: ChatRequest):
         try:
             client = ollama.AsyncClient()
             async for chunk in await client.chat(
-                model=MODEL, messages=full_messages, stream=True
+                model=model_for_request, messages=full_messages, stream=True
             ):
                 text = chunk.get("message", {}).get("content", "")
                 if text:
@@ -918,6 +1406,36 @@ html, body {
   margin-bottom:6px; font-weight:600;
 }
 .model-info { display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text-dim); }
+.model-selector {
+  display:flex; align-items:center; gap:8px; font-size:12px; color:var(--text-dim);
+  cursor:pointer; padding:4px 6px; border-radius:4px; margin:-4px -6px;
+  transition:background 0.15s;
+  user-select:none;
+}
+.model-selector:hover { background:var(--surface-2); color:var(--text); }
+.model-chevron { margin-left:auto; opacity:0.6; font-size:10px; }
+.tier-menu {
+  position:absolute; top:60px; left:12px; right:12px; z-index:50;
+  background:var(--surface-2); border:1px solid var(--border); border-radius:6px;
+  padding:4px; box-shadow:0 8px 24px rgba(0,0,0,0.4);
+}
+.tier-option {
+  padding:8px 10px; border-radius:4px; cursor:pointer; font-size:12px;
+  color:var(--text-dim); transition:all 0.1s;
+}
+.tier-option:hover { background:var(--surface); color:var(--text); }
+.tier-option.active { background:var(--accent-dim); color:var(--accent); }
+.tier-option .tier-label { font-weight:600; display:block; margin-bottom:2px; color:inherit; }
+.tier-option .tier-desc { font-size:10.5px; opacity:0.75; line-height:1.4; }
+.tier-option .tier-pulled { font-size:9px; color:var(--success); margin-left:6px; }
+.tier-option .tier-not-pulled { font-size:9px; color:var(--accent-2); margin-left:6px; }
+.tier-option.locked { opacity:0.5; cursor:not-allowed; }
+.tier-option.locked:hover { background:transparent; }
+.tier-switching {
+  position:fixed; inset:0; background:rgba(10,14,20,0.85); z-index:200;
+  display:flex; align-items:center; justify-content:center;
+  font-size:14px; color:var(--accent); letter-spacing:0.04em;
+}
 .dot { width:8px; height:8px; border-radius:50%; background:var(--success);
   box-shadow:0 0 8px rgba(103,228,128,0.5); }
 #new-chat {
@@ -1049,6 +1567,25 @@ html, body {
 .rag-info .src { display:block; margin-top:3px; }
 
 .input-area { border-top:1px solid var(--border); background:var(--surface); padding:14px 24px 18px; }
+.mode-bar {
+  max-width:820px; margin:0 auto 10px; display:flex; flex-wrap:wrap; gap:6px;
+}
+.mode-pill {
+  background:transparent; border:1px solid var(--border); color:var(--text-dim);
+  padding:4px 10px; border-radius:14px; font-family:inherit; font-size:11px;
+  cursor:pointer; transition:all 0.15s; letter-spacing:0.04em;
+}
+.mode-pill:hover { color:var(--text); border-color:var(--accent-dim); }
+.mode-pill.active {
+  background:var(--accent-dim); border-color:var(--accent); color:var(--accent);
+}
+.mode-pill .mode-help {
+  display:inline-block; margin-left:4px; opacity:0.5; cursor:help;
+}
+.mode-promoted {
+  font-size:11px; color:var(--accent-2); font-style:italic;
+  padding:2px 0 6px;
+}
 .input-wrap {
   max-width:820px; margin:0 auto; display:flex; gap:10px; align-items:flex-end;
 }
@@ -1105,10 +1642,12 @@ html, body {
   <aside class="sidebar">
     <header>
       <h1>Cortex</h1>
-      <div class="model-info">
+      <div class="model-selector" id="model-selector" title="Click to switch model">
         <span class="dot"></span>
         <span id="model-name">loading…</span>
+        <span class="model-chevron">▾</span>
       </div>
+      <div class="tier-menu" id="tier-menu" style="display:none;"></div>
     </header>
     <button id="new-chat">+ new chat</button>
     <div class="split">
@@ -1139,6 +1678,7 @@ html, body {
     </div>
     <div id="messages" class="messages"></div>
     <div class="input-area">
+      <div class="mode-bar" id="mode-bar"></div>
       <div class="input-wrap">
         <textarea id="input" rows="1" placeholder="Ask anything. Drop files to index. Attach books from the sidebar to query them. Enter to send, Shift+Enter for newline."></textarea>
         <button id="send">SEND</button>
@@ -1151,6 +1691,8 @@ html, body {
 const state = {
   currentConversationId: null, isStreaming: false,
   attachments: [], library: [], jobs: {},
+  modes: [], currentMode: 'default',
+  tiers: [], activeTier: null, currentTierRank: 1, overrideActive: false,
 };
 const $ = (s) => document.querySelector(s);
 
@@ -1357,6 +1899,162 @@ function renderRagInfo(rag) {
   div.innerHTML = html;
   messages.appendChild(div); scrollToBottom();
 }
+async function loadTiers() {
+  try {
+    const res = await fetch('/api/model/tiers');
+    const data = await res.json();
+    state.tiers = data.tiers || [];
+    state.activeTier = data.active;
+    state.overrideActive = data.override_active || false;
+  } catch (e) {
+    console.error('failed to load tiers', e);
+  }
+  renderActiveModelBadge();
+}
+function renderActiveModelBadge() {
+  const nameEl = $('#model-name');
+  if (!nameEl) return;
+  const active = state.tiers.find(t => t.id === state.activeTier);
+  if (state.overrideActive) {
+    nameEl.textContent = state.activeTier || 'custom';
+  } else if (active) {
+    nameEl.textContent = active.label;
+  } else {
+    nameEl.textContent = 'no model';
+  }
+}
+function toggleTierMenu(force) {
+  const menu = $('#tier-menu');
+  if (!menu) return;
+  const willOpen = force === undefined ? menu.style.display === 'none' : force;
+  if (state.overrideActive && willOpen) {
+    alert('CORTEX_MODEL env var is set — model switching is disabled.\nUnset CORTEX_MODEL to use the tier picker.');
+    return;
+  }
+  menu.style.display = willOpen ? 'block' : 'none';
+  if (willOpen) renderTierMenu();
+}
+async function renderTierMenu() {
+  const menu = $('#tier-menu');
+  if (!menu) return;
+  // Fetch installed Ollama models so we can mark each tier as pulled or not.
+  let installed = new Set();
+  try {
+    const res = await fetch('/api/ollama/installed');
+    const data = await res.json();
+    for (const n of data.names || []) installed.add(n);
+  } catch (e) { /* non-fatal */ }
+  menu.innerHTML = '';
+  for (const tier of state.tiers) {
+    const opt = document.createElement('div');
+    const isActive = tier.id === state.activeTier;
+    // Lenient name matching: normalize :latest, .gguf, case differences,
+    // but require the tag to match if the configured name has one.
+    const norm = (s) => {
+      let v = (s || '').toLowerCase().trim();
+      if (v.endsWith('.gguf')) v = v.slice(0, -5);
+      if (v.endsWith(':latest')) v = v.slice(0, -7);
+      return v;
+    };
+    const targetNorm = norm(tier.ollama_name);
+    const targetHasTag = targetNorm.includes(':');
+    const isPulled = Array.from(installed).some(n => {
+      const nNorm = norm(n);
+      if (nNorm === targetNorm) return true;
+      if (!targetHasTag && nNorm.startsWith(targetNorm + ':')) return true;
+      return false;
+    });
+    opt.className = 'tier-option' + (isActive ? ' active' : '');
+    const pulledTag = isPulled
+      ? '<span class="tier-pulled">✓ installed</span>'
+      : '<span class="tier-not-pulled">⚠ run: ollama pull ' + escapeHtml(tier.ollama_name) + '</span>';
+    opt.innerHTML =
+      '<div class="tier-label">' + escapeHtml(tier.label) + pulledTag + '</div>' +
+      '<div class="tier-desc">' + escapeHtml(tier.description) + '</div>';
+    if (!isActive) {
+      opt.onclick = () => switchTier(tier.id);
+    }
+    menu.appendChild(opt);
+  }
+}
+async function switchTier(tierId) {
+  // Show a brief overlay so the user knows the switch is in progress.
+  const overlay = document.createElement('div');
+  overlay.className = 'tier-switching';
+  overlay.textContent = 'switching model...';
+  document.body.appendChild(overlay);
+  try {
+    const res = await fetch('/api/model/switch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tier: tierId}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Switch failed: ' + (err.detail || res.status));
+      return;
+    }
+    state.activeTier = tierId;
+    renderActiveModelBadge();
+    toggleTierMenu(false);
+    // Refresh modes since tier changed (some may now be available/unavailable).
+    await loadModes();
+  } catch (e) {
+    alert('Switch error: ' + e.message);
+  } finally {
+    overlay.remove();
+  }
+}
+async function loadModes() {
+  try {
+    const res = await fetch('/api/modes');
+    const data = await res.json();
+    state.modes = data.modes || [];
+    state.currentTierRank = data.current_tier_rank || 1;
+    if (data.default && !state.currentMode) state.currentMode = data.default;
+    // If the previously-selected mode is now locked behind a higher tier,
+    // fall back to default so we don't silently send a question with a
+    // scaffold the model can't handle.
+    const cur = state.modes.find(m => m.id === state.currentMode);
+    if (cur && cur.min_tier > state.currentTierRank) {
+      state.currentMode = data.default;
+    }
+  } catch (e) {
+    console.error('failed to load modes', e);
+  }
+  renderModeBar();
+}
+function renderModeBar() {
+  const bar = $('#mode-bar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  for (const mode of state.modes) {
+    const locked = mode.min_tier > (state.currentTierRank || 1);
+    if (locked) continue;  // hide unavailable modes entirely
+    const btn = document.createElement('button');
+    btn.className = 'mode-pill' + (mode.id === state.currentMode ? ' active' : '');
+    btn.textContent = mode.label;
+    btn.title = mode.description;
+    btn.onclick = () => {
+      state.currentMode = mode.id;
+      renderModeBar();
+    };
+    bar.appendChild(btn);
+  }
+}
+function renderModePromotion(modeMeta) {
+  const messages = $('#messages');
+  const div = document.createElement('div');
+  div.className = 'message system-info';
+  const requested = state.modes.find(m => m.id === modeMeta.requested);
+  const effective = state.modes.find(m => m.id === modeMeta.effective);
+  const reqLabel = requested ? requested.label : modeMeta.requested;
+  const effLabel = effective ? effective.label : modeMeta.effective;
+  div.innerHTML = '<div class="role">MODE</div><div class="content"><div class="mode-promoted">' +
+    'Multiple sources attached — switched from <b>' + escapeHtml(reqLabel) +
+    '</b> to <b>' + escapeHtml(effLabel) + '</b> for this question.</div></div>';
+  messages.appendChild(div); scrollToBottom();
+}
 async function sendMessage() {
   if (state.isStreaming) return;
   const input = $('#input'); const content = input.value.trim();
@@ -1371,7 +2069,11 @@ async function sendMessage() {
   try {
     const response = await fetch('/api/chat', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({conversation_id: state.currentConversationId, content: content}),
+      body: JSON.stringify({
+        conversation_id: state.currentConversationId,
+        content: content,
+        mode: state.currentMode,
+      }),
     });
     if (!response.ok) throw new Error('HTTP '+response.status);
     const reader = response.body.getReader();
@@ -1388,6 +2090,9 @@ async function sendMessage() {
         let data; try { data = JSON.parse(event.slice(6)); } catch { continue; }
         if (data.type === 'meta') {
           state.currentConversationId = data.conversation_id;
+          if (data.mode && data.mode.auto_promoted) {
+            renderModePromotion(data.mode);
+          }
           if (!ragShown && data.rag) {
             const messages = $('#messages');
             messages.removeChild(aiDiv);
@@ -1485,14 +2190,9 @@ function setupDragDrop() {
 }
 
 async function init() {
-  try {
-    const res = await fetch('/api/model');
-    const data = await res.json();
-    $('#model-name').textContent = data.model;
-  } catch {
-    $('#model-name').textContent = 'connection error';
-  }
+  await loadTiers();
   await loadLibrary();
+  await loadModes();
   showEmptyState();
   await loadConversations();
   $('#new-chat').onclick = newChat;
@@ -1502,6 +2202,18 @@ async function init() {
     if (e.target.files.length) uploadFiles(e.target.files);
     e.target.value = '';
   };
+  $('#model-selector').onclick = (e) => {
+    e.stopPropagation();
+    toggleTierMenu();
+  };
+  // Close menu when clicking outside
+  document.addEventListener('click', (e) => {
+    const menu = $('#tier-menu');
+    if (!menu || menu.style.display === 'none') return;
+    if (!menu.contains(e.target) && !$('#model-selector').contains(e.target)) {
+      toggleTierMenu(false);
+    }
+  });
   const input = $('#input');
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
