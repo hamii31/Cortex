@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cortex.py - Offline chat app with built-in indexer + RAG.
+cortex.py - Offline chat app with built-in indexer + RAG. 
 
 Drag-and-drop or upload PDF / EPUB / DOCX / TXT / MD files. Cortex
 extracts, chunks, embeds, and caches them locally. Attach indexed
