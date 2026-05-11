@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cortex.py - Offline chat app with built-in indexer + RAG. 
+cortex.py - Offline chat app with built-in indexer + RAG.
 
 Drag-and-drop or upload PDF / EPUB / DOCX / TXT / MD files. Cortex
 extracts, chunks, embeds, and caches them locally. Attach indexed
@@ -191,18 +191,29 @@ def _cortex_library_dir() -> Path:
 
 
 def _smartreader_cache_dir() -> Path | None:
-    """Optional: also read from SmartReader's cache if it's set."""
+    """SmartReader cache integration is opt-in.
+
+    To enable, set the CORTEX_SMARTREADER_CACHE environment variable to the
+    path of an existing SmartReader cache directory. Cortex then exposes
+    those caches as read-only library entries tagged `sr`.
+
+    Auto-detection was removed in 1.2: SmartReader caches lack the hierarchical
+    section summaries Cortex now produces, and surfacing them by default
+    created confusing duplicates with Cortex-native caches of the same books.
+    Users migrating from SmartReader should re-index in Cortex to take
+    advantage of structure-aware indexing.
+    """
     override = os.environ.get("CORTEX_SMARTREADER_CACHE")
-    if override:
-        return Path(override)
-    # Auto-detect: if SmartReader cache exists at standard path, use it too
-    if sys.platform == "win32":
-        sr = Path(os.environ.get("APPDATA", "")) / "SmartReader" / "cache"
-    elif sys.platform == "darwin":
-        sr = Path.home() / "Library" / "Application Support" / "SmartReader" / "cache"
-    else:
-        sr = Path.home() / ".config" / "smartreader" / "cache"
-    return sr if sr.exists() else None
+    if not override:
+        return None
+    p = Path(override)
+    if not p.exists():
+        print(
+            f"WARN: CORTEX_SMARTREADER_CACHE={override} but path does not exist",
+            file=sys.stderr,
+        )
+        return None
+    return p
 
 
 LIBRARY_DIR = _cortex_library_dir()
@@ -405,6 +416,483 @@ def file_hash(path: Path) -> str:
     return h.hexdigest()
 
 
+# === Hierarchical summarization ===========================================
+# At index time, group chunks into sections (~10-20 chunks each, aligned
+# to page/chapter boundaries when possible) and produce an LLM summary
+# of each section. At query time, when chunks are retrieved we also
+# fetch their section summaries — this gives the model both detail
+# (verbatim chunks) and context (what the surrounding section is about),
+# which addresses the most common chunk-retrieval failure: technically
+# correct answer that misses the larger argument.
+#
+# Summaries are stored separately from chunks so:
+#   - existing caches remain loadable without re-indexing
+#   - summaries can be regenerated without redoing embeddings
+#   - the format change is incremental, not breaking
+#
+# Summarization is conditional: skipped on small documents where the
+# whole thing fits in context anyway. Defaults are tuned for the Lite
+# tier; higher tiers are fine with the same numbers.
+
+SUMMARIZE_MIN_CHUNKS = 30        # don't summarize tiny documents
+SUMMARIZE_SECTION_SIZE = 15      # ~15 chunks per section (~15000 chars)
+SUMMARIZE_MAX_INPUT_CHARS = 12000  # cap section size handed to the LLM
+SUMMARIZE_TARGET_WORDS = 120     # asked-for summary length
+
+
+class Section:
+    """A contiguous group of chunks plus an LLM-produced summary.
+    `title` is set when the section corresponds to a known structural unit
+    (PDF outline entry, parsed TOC entry); empty for fallback page-count sections."""
+    def __init__(self, section_id: int, chunk_ids: list[int],
+                 page_range: tuple[int, int], summary: str = "",
+                 title: str = ""):
+        self.section_id = section_id
+        self.chunk_ids = chunk_ids
+        self.page_range = page_range
+        self.summary = summary
+        self.title = title
+
+    def to_dict(self) -> dict:
+        return {
+            "section_id": self.section_id,
+            "chunk_ids": self.chunk_ids,
+            "page_range": list(self.page_range),
+            "summary": self.summary,
+            "title": self.title,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Section":
+        return cls(
+            d["section_id"],
+            list(d["chunk_ids"]),
+            tuple(d["page_range"]),
+            d.get("summary", ""),
+            d.get("title", ""),
+        )
+
+
+def summaries_path_for(cache_path: Path) -> Path:
+    """Companion path for a chunk cache's summaries file."""
+    return cache_path.with_suffix(".summaries.json")
+
+
+def load_summaries(cache_path: Path) -> list[Section]:
+    """Load summaries for a cache. Returns empty list if not yet summarized
+    (older caches, small documents, or summarization skipped)."""
+    p = summaries_path_for(cache_path)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return [Section.from_dict(s) for s in data.get("sections", [])]
+    except Exception as e:
+        print(f"WARN: could not load summaries {p}: {e}", file=sys.stderr)
+        return []
+
+
+def save_summaries(cache_path: Path, sections: list[Section]) -> None:
+    p = summaries_path_for(cache_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        json.dumps({"sections": [s.to_dict() for s in sections]}, indent=2),
+        encoding="utf-8",
+    )
+
+
+# --- Document structure extraction ----------------------------------------
+# Books usually have explicit chapter/section structure. When we can recover
+# it, the resulting sections are far more coherent than fixed-size chunking.
+# Three approaches, tried in order:
+#   1. PDF outline / bookmarks (built into well-made PDFs)
+#   2. Table-of-contents page parsing (regex on text)
+#   3. Fallback: fixed-size page-aligned chunking (the original strategy)
+
+TOC_MIN_ENTRIES = 4         # need at least N entries to trust a structure
+TOC_MIN_SECTION_CHUNKS = 4  # below this, merge with neighbor
+
+
+def extract_pdf_outline(pdf_path: Path) -> list[tuple[str, int]]:
+    """Read the PDF's built-in outline (bookmarks). Returns a flat list of
+    (title, 1-indexed page number) entries, or [] if no usable outline exists.
+
+    PDF outlines are trees; we flatten to a list. Sub-entries become their
+    own sections at the same level — which is what we want for retrieval
+    purposes (chapter and its subsections are both queryable units).
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        try:
+            from PyPDF2 import PdfReader
+        except ImportError:
+            return []
+
+    try:
+        reader = PdfReader(str(pdf_path))
+        outline = reader.outline
+    except Exception as e:
+        print(f"WARN: could not read PDF outline: {e}", file=sys.stderr)
+        return []
+
+    entries: list[tuple[str, int]] = []
+
+    def _walk(items, depth: int = 0) -> None:
+        for item in items:
+            if isinstance(item, list):
+                _walk(item, depth + 1)
+                continue
+            try:
+                title = getattr(item, "title", None) or ""
+                title = str(title).strip()
+                if not title:
+                    continue
+                # Resolve the page reference to a 1-indexed page number
+                page_num = reader.get_destination_page_number(item)  # 0-indexed
+                if page_num is None:
+                    continue
+                entries.append((title, page_num + 1))
+            except Exception:
+                continue
+
+    try:
+        _walk(outline)
+    except Exception as e:
+        print(f"WARN: outline walk failed: {e}", file=sys.stderr)
+        return []
+
+    # Deduplicate consecutive entries pointing at the same page
+    deduped: list[tuple[str, int]] = []
+    for title, page in entries:
+        if deduped and deduped[-1][1] == page:
+            continue
+        deduped.append((title, page))
+    return deduped
+
+
+# Regex patterns for matching TOC lines. The structure varies but most
+# have "Chapter N Title ... page" or "N.N Title ... page" formats.
+# We match conservatively to avoid false positives in body text.
+_TOC_LINE_PATTERNS = [
+    # "Chapter 3   The Brain   47"
+    re.compile(r"^\s*(?:Chapter|Ch\.?|Part|Section)\s+(\d+|[IVXLCDM]+)\s+(.+?)\s+(\d{1,4})\s*$",
+               re.IGNORECASE),
+    # "3.2  Synaptic plasticity   142"
+    re.compile(r"^\s*(\d+(?:\.\d+)*)\s+(.+?)\s+(\d{1,4})\s*$"),
+    # "Introduction ............. 1"  (dot leaders)
+    re.compile(r"^\s*([^\d\.][^\.]{2,80}?)\s*\.{2,}\s*(\d{1,4})\s*$"),
+    # "The Limbic System    73"  (loose form, last-resort)
+    re.compile(r"^\s*([A-Z][^\d]{4,80}?)\s{2,}(\d{1,4})\s*$"),
+]
+
+
+def parse_toc_from_text(pages: list[tuple[int, str]]) -> list[tuple[str, int]]:
+    """Find a TOC page by name, parse it for chapter/page entries.
+
+    Looks for pages near the front of the document whose text contains the
+    word "Contents" or "Table of Contents." Then parses lines using the
+    patterns above. Returns [] if no plausible TOC is found.
+    """
+    # Search the first 30 pages for a TOC marker
+    toc_pages: list[str] = []
+    in_toc = False
+    for page_num, text in pages[:30]:
+        head = text.strip().split("\n", 3)[0:3]
+        head_text = " ".join(head).lower()
+        if not in_toc and ("contents" in head_text or "table of contents" in head_text):
+            in_toc = True
+        if in_toc:
+            toc_pages.append(text)
+            # TOC usually doesn't span more than 5-8 pages; stop if we find
+            # what looks like chapter content (paragraph-shaped text)
+            line_count = len([l for l in text.split("\n") if l.strip()])
+            avg_line_len = (sum(len(l) for l in text.split("\n")) / max(1, line_count))
+            if avg_line_len > 80 and len(toc_pages) >= 2:
+                break
+            if len(toc_pages) >= 8:
+                break
+
+    if not toc_pages:
+        return []
+
+    # Apply patterns to each line
+    entries: list[tuple[str, int]] = []
+    for page_text in toc_pages:
+        for line in page_text.split("\n"):
+            line = line.strip()
+            if not line or len(line) < 6:
+                continue
+            for pat in _TOC_LINE_PATTERNS:
+                m = pat.match(line)
+                if not m:
+                    continue
+                groups = m.groups()
+                # Last group is always the page number
+                try:
+                    page = int(groups[-1])
+                except ValueError:
+                    break
+                # Title is everything before the page number
+                title_parts = [g for g in groups[:-1] if g]
+                title = " ".join(title_parts).strip()
+                # Reject obvious false positives
+                if not title or page < 1 or page > 9999:
+                    break
+                if len(title) > 120:  # probably matched a sentence, not a TOC line
+                    break
+                entries.append((title, page))
+                break
+
+    # Sanity: TOC pages should monotonically increase
+    cleaned: list[tuple[str, int]] = []
+    last_page = 0
+    for title, page in entries:
+        if page < last_page:
+            # Out-of-order — this isn't really a TOC entry, skip
+            continue
+        cleaned.append((title, page))
+        last_page = page
+
+    return cleaned
+
+
+def sections_from_structure(chunks: list[TextChunk],
+                            structure: list[tuple[str, int]]
+                            ) -> list[Section]:
+    """Given a list of (chapter_title, start_page) entries, build sections
+    by assigning each chunk to the chapter that contains its page.
+
+    Tiny sections (fewer than TOC_MIN_SECTION_CHUNKS chunks) are merged
+    backward into the previous section — these are usually preface entries,
+    appendix subsections, or TOC parsing artifacts that we don't want as
+    standalone summarizable units.
+    """
+    if not chunks or not structure:
+        return []
+
+    # Sort structure by page number; the outline order isn't always page-order
+    # (e.g. some books list appendices before bibliography)
+    structure = sorted(structure, key=lambda t: t[1])
+
+    # Build sections by walking chunks and assigning to the latest chapter
+    # whose start_page is <= the chunk's page.
+    sections: list[Section] = []
+    current_chunks: list[int] = []
+    current_title = ""
+    current_start_page = chunks[0].page_number
+    current_struct_idx = -1
+
+    def _flush(end_page: int) -> None:
+        nonlocal current_chunks
+        if not current_chunks:
+            return
+        sections.append(Section(
+            section_id=len(sections),
+            chunk_ids=current_chunks.copy(),
+            page_range=(current_start_page, end_page),
+            title=current_title,
+        ))
+        current_chunks = []
+
+    last_page = chunks[0].page_number
+    for chunk in chunks:
+        # Which structural entry does this chunk fall under?
+        target_idx = current_struct_idx
+        for i, (_, start_page) in enumerate(structure):
+            if start_page <= chunk.page_number:
+                target_idx = i
+            else:
+                break
+        # Crossed into a new chapter — flush the previous section
+        if target_idx != current_struct_idx:
+            _flush(last_page)
+            current_struct_idx = target_idx
+            if target_idx >= 0:
+                current_title = structure[target_idx][0]
+                current_start_page = structure[target_idx][1]
+            else:
+                current_title = ""  # pre-first-chapter material
+                current_start_page = chunk.page_number
+        current_chunks.append(chunk.chunk_id)
+        last_page = chunk.page_number
+    _flush(last_page)
+
+    # Merge tiny sections backward — TOC parsing often produces single-page
+    # entries for things like "About the Author" that aren't worth their own
+    # summary. The threshold of TOC_MIN_SECTION_CHUNKS is conservative.
+    merged: list[Section] = []
+    for section in sections:
+        if (merged
+                and len(section.chunk_ids) < TOC_MIN_SECTION_CHUNKS
+                and len(merged[-1].chunk_ids) + len(section.chunk_ids) < SUMMARIZE_SECTION_SIZE * 2):
+            prev = merged[-1]
+            prev.chunk_ids.extend(section.chunk_ids)
+            prev.page_range = (prev.page_range[0], section.page_range[1])
+            # Keep the earlier title — usually the parent chapter
+        else:
+            merged.append(section)
+
+    # Renumber section_ids after merging
+    for i, s in enumerate(merged):
+        s.section_id = i
+
+    return merged
+
+
+def build_sections(chunks: list[TextChunk],
+                   src_path: Path | None = None,
+                   pages: list[tuple[int, str]] | None = None,
+                   target_chunks_per_section: int = SUMMARIZE_SECTION_SIZE,
+                   ) -> list[Section]:
+    """Build sections for a document, preferring structural cues over
+    fixed-size chunking.
+
+    Strategy in order of preference:
+      1. If src_path is a PDF and has a usable outline → use that
+      2. If pages were provided and contain a parseable TOC → use that
+      3. Fallback: page-aligned fixed-size grouping (the original strategy)
+    """
+    if not chunks:
+        return []
+
+    # Attempt 1: PDF outline
+    if src_path and src_path.suffix.lower() == ".pdf":
+        structure = extract_pdf_outline(src_path)
+        if len(structure) >= TOC_MIN_ENTRIES:
+            sections = sections_from_structure(chunks, structure)
+            if sections:
+                print(f"  Used PDF outline: {len(sections)} sections", file=sys.stderr)
+                return sections
+
+    # Attempt 2: TOC page parsing
+    if pages:
+        structure = parse_toc_from_text(pages)
+        if len(structure) >= TOC_MIN_ENTRIES:
+            sections = sections_from_structure(chunks, structure)
+            if sections:
+                print(f"  Parsed TOC: {len(sections)} sections", file=sys.stderr)
+                return sections
+
+    # Attempt 3: fallback to original fixed-size strategy
+    return _build_sections_fixed(chunks, target_chunks_per_section)
+
+
+def _build_sections_fixed(chunks: list[TextChunk],
+                          target_chunks_per_section: int,
+                          ) -> list[Section]:
+    """Original fixed-size, page-aligned section builder. Used as fallback
+    when no structural cues are recoverable."""
+    if not chunks:
+        return []
+    sections: list[Section] = []
+    buf: list[int] = []
+    buf_start_page = chunks[0].page_number
+    last_page = chunks[0].page_number
+
+    for chunk in chunks:
+        # If buffer is full enough AND we just crossed a page boundary,
+        # close the section. The page-boundary check avoids splitting
+        # arbitrary content mid-page.
+        if (len(buf) >= target_chunks_per_section
+                and chunk.page_number != last_page):
+            sections.append(Section(
+                section_id=len(sections),
+                chunk_ids=buf.copy(),
+                page_range=(buf_start_page, last_page),
+            ))
+            buf = []
+            buf_start_page = chunk.page_number
+        buf.append(chunk.chunk_id)
+        last_page = chunk.page_number
+
+    if buf:
+        sections.append(Section(
+            section_id=len(sections),
+            chunk_ids=buf.copy(),
+            page_range=(buf_start_page, last_page),
+        ))
+    return sections
+
+
+def summarize_section(section_text: str, doc_title: str) -> str:
+    """Ask the active LLM to summarize a section of the document.
+    Returns empty string on failure — caller can decide whether to retry."""
+    # Truncate input to avoid blowing out context on small models.
+    truncated = section_text[:SUMMARIZE_MAX_INPUT_CHARS]
+    if len(section_text) > SUMMARIZE_MAX_INPUT_CHARS:
+        truncated += "\n\n[...section continues; this is a partial view...]"
+
+    system = (
+        "You are summarizing a section of a longer document for a retrieval "
+        "system. Your summary will be shown alongside specific excerpts from "
+        "this section when a user asks a question that touches it. The "
+        "summary's job is to give context — what this section is fundamentally "
+        "about, what it argues or describes, and how it connects to the "
+        "broader document. Be concrete; mention specific concepts, methods, "
+        "or claims by name. Avoid generic phrasing like 'this section "
+        "discusses various topics'."
+    )
+    user = (
+        f"Document title: {doc_title}\n\n"
+        f"Section content:\n{truncated}\n\n"
+        f"Produce a {SUMMARIZE_TARGET_WORDS}-word summary of what this "
+        f"section is about. Output only the summary text, no preamble."
+    )
+
+    try:
+        resp = ollama.chat(
+            model=active_model_name(),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            options={"temperature": 0.3},  # lower than chat — we want consistency
+        )
+        return resp["message"]["content"].strip()
+    except Exception as e:
+        print(f"WARN: summarization failed: {e}", file=sys.stderr)
+        return ""
+
+
+def summarize_book(chunks: list[TextChunk], doc_title: str,
+                   progress: Callable[[int, int, str], None],
+                   progress_start: int = 96, progress_end: int = 99,
+                   src_path: Path | None = None,
+                   pages: list[tuple[int, str]] | None = None,
+                   ) -> list[Section]:
+    """Build sections and summarize each one. Updates progress in the
+    given range. Returns sections with summaries filled in (may be empty
+    strings on failure — we don't fail the whole index if summarization
+    has trouble).
+
+    src_path and pages are passed to build_sections so it can use structural
+    cues (PDF outline, TOC page) when available; without them, falls back
+    to fixed-size page-aligned grouping."""
+    sections = build_sections(chunks, src_path=src_path, pages=pages)
+    if not sections:
+        return []
+
+    progress(progress_start, 100, f"Summarizing {len(sections)} sections...")
+    chunks_by_id = {c.chunk_id: c for c in chunks}
+
+    for i, section in enumerate(sections):
+        # Assemble section text from its chunks
+        section_text = "\n\n".join(
+            chunks_by_id[cid].text
+            for cid in section.chunk_ids
+            if cid in chunks_by_id
+        )
+        section.summary = summarize_section(section_text, doc_title)
+        # Smooth progress update across the summarization range
+        if i % 2 == 0 or i == len(sections) - 1:
+            span = max(1, progress_end - progress_start)
+            pct = progress_start + int((i + 1) / len(sections) * span)
+            progress(pct, 100, f"Summarizing {i + 1}/{len(sections)} sections...")
+
+    return sections
+
+
 def index_file(src_path: Path, book_id: str,
                progress: Callable[[int, int, str], None],
                display_title: str | None = None) -> Path:
@@ -437,6 +925,20 @@ def index_file(src_path: Path, book_id: str,
     fh = file_hash(src_path)
     out = cache_path_for(fh, title)
     save_pickle_chunks(out, chunks)
+
+    # Hierarchical summarization — only worth doing for documents large enough
+    # that section-level context actually helps. Small documents fit in
+    # context anyway.
+    skip_summaries = os.environ.get("CORTEX_SKIP_SUMMARIES", "").lower() in ("1", "true", "yes")
+    if not skip_summaries and len(chunks) >= SUMMARIZE_MIN_CHUNKS:
+        try:
+            sections = summarize_book(chunks, title, progress,
+                                      progress_start=96, progress_end=99,
+                                      src_path=src_path, pages=pages)
+            save_summaries(out, sections)
+        except Exception as e:
+            print(f"WARN: summarization failed for {title}: {e}", file=sys.stderr)
+
     progress(100, 100, "Done")
     return out
 
@@ -479,6 +981,9 @@ class Book:
         self.source = source     # "cortex" or "smartreader"
         self.chunks: list[TextChunk] = []
         self.matrix: np.ndarray | None = None
+        self.sections: list[Section] = []
+        # chunk_id -> section_id, built once at load time for O(1) lookup
+        self._chunk_to_section: dict[int, int] = {}
 
     def load(self) -> None:
         self.chunks = load_pickle_chunks(self.path)
@@ -488,10 +993,25 @@ class Book:
         embs = np.array([c.embedding for c in self.chunks], dtype=np.float32)
         norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10
         self.matrix = embs / norms
+        # Load hierarchical summaries if available — older caches won't have them
+        self.sections = load_summaries(self.path)
+        self._chunk_to_section = {
+            cid: s.section_id
+            for s in self.sections
+            for cid in s.chunk_ids
+        }
+
+    def section_for_chunk(self, chunk_id: int) -> Section | None:
+        sid = self._chunk_to_section.get(chunk_id)
+        if sid is None or sid >= len(self.sections):
+            return None
+        return self.sections[sid]
 
     def unload(self) -> None:
         self.chunks = []
         self.matrix = None
+        self.sections = []
+        self._chunk_to_section = {}
 
 
 _BOOKS: dict[str, Book] = {}
@@ -581,40 +1101,54 @@ def retrieve(book_ids: list[str], query: str, top_k: int | None = None) -> list[
     if qvec is None:
         return []
 
-    # Per-book scored chunks: {book_id: [(score, title, chunk), ...]}
-    by_book: dict[str, list[tuple[float, str, TextChunk]]] = {}
+    # Per-book scored chunks: {book_id: [(score, Book, chunk), ...]}
+    # Carrying the Book reference (not just title) lets us look up section
+    # summaries downstream without a second discover_books call.
+    by_book: dict[str, list[tuple[float, Book, TextChunk]]] = {}
     for bid in book_ids:
         book = ensure_loaded(bid)
         if not book or book.matrix is None:
             continue
         scores = book.matrix @ qvec
-        # Sort descending — full sort is fine, books rarely have >50k chunks
         order = np.argsort(-scores)
         by_book[bid] = [
-            (float(scores[i]), book.title, book.chunks[i])
+            (float(scores[i]), book, book.chunks[i])
             for i in order
         ]
 
     if not by_book:
         return []
 
+    def _to_result(s: float, book: Book, chunk: TextChunk) -> dict:
+        """Pack a scored chunk into the result dict, attaching section
+        context if hierarchical summaries are available for this book."""
+        out = {
+            "score": s,
+            "book": book.title,
+            "page": chunk.page_number,
+            "text": chunk.text,
+        }
+        section = book.section_for_chunk(chunk.chunk_id)
+        if section and section.summary:
+            out["section_summary"] = section.summary
+            out["section_pages"] = list(section.page_range)
+            if section.title:
+                out["section_title"] = section.title
+        return out
+
     # Single-book case: just take the top-K. No reservation needed.
     if len(by_book) == 1:
         only = next(iter(by_book.values()))
         result = only[:top_k]
-        return [
-            {"score": s, "book": title, "page": chunk.page_number, "text": chunk.text}
-            for s, title, chunk in result
-        ]
+        return [_to_result(s, book, chunk) for s, book, chunk in result]
 
     # Multi-book case: reserve at least 1 chunk per book, then fill.
-    # Cap reservations so we don't end up with more reserved slots than top_k.
     n_books = len(by_book)
-    min_per_book = max(1, top_k // (n_books * 2))   # at least 1, more if top_k is large
-    min_per_book = min(min_per_book, top_k // n_books)  # never starve the global pool
+    min_per_book = max(1, top_k // (n_books * 2))
+    min_per_book = min(min_per_book, top_k // n_books)
 
-    reserved: list[tuple[float, str, TextChunk]] = []
-    seen: set[int] = set()  # chunk identity by id() to avoid double-picking
+    reserved: list[tuple[float, Book, TextChunk]] = []
+    seen: set[int] = set()
     for bid, scored in by_book.items():
         for entry in scored[:min_per_book]:
             reserved.append(entry)
@@ -622,7 +1156,7 @@ def retrieve(book_ids: list[str], query: str, top_k: int | None = None) -> list[
 
     # Build the global pool of remaining candidates and fill the rest.
     remaining_slots = max(0, top_k - len(reserved))
-    global_pool: list[tuple[float, str, TextChunk]] = []
+    global_pool: list[tuple[float, Book, TextChunk]] = []
     for scored in by_book.values():
         for entry in scored:
             if id(entry[2]) in seen:
@@ -633,10 +1167,7 @@ def retrieve(book_ids: list[str], query: str, top_k: int | None = None) -> list[
     final = reserved + global_pool[:remaining_slots]
     final.sort(key=lambda t: t[0], reverse=True)
 
-    return [
-        {"score": s, "book": title, "page": chunk.page_number, "text": chunk.text}
-        for s, title, chunk in final
-    ]
+    return [_to_result(s, book, chunk) for s, book, chunk in final]
 
 
 # === Database =============================================================
@@ -693,6 +1224,8 @@ SYSTEM_RAG_SUFFIX = """
 
 The user has attached source documents to this conversation. The system has retrieved the most relevant excerpts for their question. Use them as primary grounding material.
 
+Some excerpts are preceded by a [Section context — Title, pp. X-Y] block — this is a high-level summary of the surrounding section, provided to help you understand what argument or topic the specific excerpts are situated in. Use section context to interpret excerpts correctly, but cite specific excerpts (with their page numbers), not the section summary, when making concrete claims.
+
 Rules:
 - Cite specific pages when you draw on the excerpts. Format: [Title, p. N].
 - For non-PDF sources, "p. N" maps to chapter (EPUB) or section (DOCX/text) — cite it the same way.
@@ -718,12 +1251,45 @@ def format_rag_context(chunks: list[dict]) -> str:
     else:
         header = "Retrieved excerpts from attached sources:\n\n"
 
-    blocks = []
+    # Group chunks by (book, section_pages) so a single section summary
+    # appears once even if multiple chunks from that section are retrieved.
+    # The model gets section context up front, then the specific excerpts —
+    # this is the "hierarchical context" pattern: zoom out, then zoom in.
+    from collections import defaultdict
+    groups: dict[tuple, list[tuple[int, dict]]] = defaultdict(list)
     for i, c in enumerate(chunks, 1):
-        blocks.append(
-            f"[Excerpt {i}] {c['book']}, p. {c['page']} (relevance {c['score']:.2f})\n"
-            f"{c['text'].strip()}"
+        sec_key = (
+            c["book"],
+            tuple(c.get("section_pages", [])) if c.get("section_summary") else None,
         )
+        groups[sec_key].append((i, c))
+
+    blocks = []
+    for (book, section_pages), members in groups.items():
+        # If this group has a section summary, show it once at the top
+        first = members[0][1]
+        section_summary = first.get("section_summary", "")
+        section_title = first.get("section_title", "")
+        if section_summary and section_pages:
+            sp_start, sp_end = section_pages
+            page_label = (
+                f"p. {sp_start}" if sp_start == sp_end
+                else f"pp. {sp_start}–{sp_end}"
+            )
+            # Include chapter title when we have one — gives the model
+            # the structural cue ("this is Chapter 3: Synaptic Plasticity")
+            # in addition to the prose summary.
+            if section_title:
+                header_line = f"[Section context — {book}, '{section_title}', {page_label}]"
+            else:
+                header_line = f"[Section context — {book}, {page_label}]"
+            blocks.append(f"{header_line}\n{section_summary}")
+        for idx, c in members:
+            blocks.append(
+                f"[Excerpt {idx}] {c['book']}, p. {c['page']} "
+                f"(relevance {c['score']:.2f})\n{c['text'].strip()}"
+            )
+
     return header + "\n\n---\n\n".join(blocks)
 
 
@@ -1102,13 +1668,16 @@ async def _idle_watchdog():
 @app.get("/api/library")
 def list_library():
     discover_books()
-    return [
-        {
+    results = []
+    for b in sorted(_BOOKS.values(), key=lambda x: x.title.lower()):
+        # Cheap check: does the summaries companion file exist?
+        has_summaries = summaries_path_for(b.path).exists()
+        results.append({
             "id": b.id, "title": b.title, "source": b.source,
             "size_mb": round(b.path.stat().st_size / (1024 * 1024), 1),
-        }
-        for b in sorted(_BOOKS.values(), key=lambda x: x.title.lower())
-    ]
+            "has_summaries": has_summaries,
+        })
+    return results
 
 
 @app.delete("/api/library/{book_id}")
@@ -1120,13 +1689,64 @@ def delete_book(book_id: str):
         raise HTTPException(400, "cannot delete imported SmartReader caches")
     try:
         book.path.unlink(missing_ok=True)
+        # Also remove the summaries companion file if it exists
+        summaries_path_for(book.path).unlink(missing_ok=True)
     except Exception as e:
         raise HTTPException(500, f"delete failed: {e}")
     _BOOKS.pop(book_id, None)
-    # Also remove any attachments to this book
     with _db() as c:
         c.execute("DELETE FROM attachments WHERE book_id = ?", (book_id,))
     return {"ok": True}
+
+
+@app.post("/api/library/{book_id}/summarize")
+async def summarize_existing(book_id: str):
+    """Generate hierarchical summaries for a previously-indexed book.
+    Used to retroactively add summaries to caches indexed before this feature
+    existed, or to regenerate summaries after switching to a stronger model."""
+    book = _BOOKS.get(book_id)
+    if not book:
+        raise HTTPException(404, "book not found")
+    if book.source != "cortex":
+        raise HTTPException(400, "cannot modify imported SmartReader caches")
+
+    # Make sure the book's chunks are loaded
+    book = ensure_loaded(book_id)
+    if not book or not book.chunks:
+        raise HTTPException(500, "book has no loadable chunks")
+
+    job_id = "sum:" + uuid.uuid4().hex[:12]
+    INDEX_JOBS[job_id] = {
+        "status": "running", "progress": 0, "total": 100,
+        "message": "Queued...", "filename": f"Summarize: {book.title}",
+    }
+
+    def _do_summarize() -> None:
+        job = INDEX_JOBS[job_id]
+        def progress(cur: int, tot: int, msg: str) -> None:
+            job["progress"] = cur
+            job["total"] = tot
+            job["message"] = msg
+        try:
+            progress(5, 100, "Building sections...")
+            sections = summarize_book(
+                book.chunks, book.title, progress,
+                progress_start=10, progress_end=98,
+            )
+            save_summaries(book.path, sections)
+            # Refresh the in-memory book so the new summaries take effect
+            book.sections = sections
+            book._chunk_to_section = {
+                cid: s.section_id for s in sections for cid in s.chunk_ids
+            }
+            job["status"] = "done"
+            progress(100, 100, "Done")
+        except Exception as e:
+            job["status"] = "error"
+            job["message"] = str(e)
+
+    asyncio.create_task(asyncio.to_thread(_do_summarize))
+    return {"job_id": job_id}
 
 
 @app.post("/api/library/upload")
