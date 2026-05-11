@@ -6,7 +6,7 @@
 
 A fully offline chat app for local LLMs via Ollama, with built-in document indexing, retrieval-augmented generation, runtime model switching, and structured reasoning modes. Drop a PDF, EPUB, DOCX, or text file into the window, attach it to a conversation, and query it with the model that best fits your hardware. No cloud, no telemetry, no internet required after setup.
 
-![offline](https://img.shields.io/badge/offline-yes-67e480?style=flat-square) ![ollama](https://img.shields.io/badge/runtime-ollama-5dd9ff?style=flat-square) ![rag](https://img.shields.io/badge/RAG-built--in-ff9d5d?style=flat-square) ![modes](https://img.shields.io/badge/modes-5-c084fc?style=flat-square) [![DOI](https://zenodo.org/badge/1231694841.svg)](https://doi.org/10.5281/zenodo.20069615)
+![offline](https://img.shields.io/badge/offline-yes-67e480?style=flat-square) ![ollama](https://img.shields.io/badge/runtime-ollama-5dd9ff?style=flat-square) ![rag](https://img.shields.io/badge/RAG-built--in-ff9d5d?style=flat-square) ![modes](https://img.shields.io/badge/modes-5-c084fc?style=flat-square) [![DOI](https://zenodo.org/badge/1231694841.svg)](https://doi.org/10.5281/zenodo.20069615) [![Downloads](https://img.shields.io/github/downloads/hamii31/Cortex/total?style=flat-square)](https://github.com/hamii31/Cortex/releases)
 
 ## What it is
 
